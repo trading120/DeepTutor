@@ -1,0 +1,74 @@
+# =============================================================================
+# Benchmark Configuration - Tutor Evaluation Data Generation
+# =============================================================================
+# 本配置用于从已有的 per-subtopic 知识库生成评测数据。
+# subtopic 已人为拆分好，每个 topic 对应一个已构建的 RAG 知识库。
+
+# 知识库配置
+knowledge_bases:
+  # 知识库基础目录（会被 main.yaml 中的 paths.knowledge_bases_dir 覆盖）
+  base_dir: "./data/knowledge_bases"
+  # 要处理的知识库名称列表（留空则自动发现所有已注册的知识库）
+  kb_names: []
+
+# Profile 生成配置
+profile_generation:
+  # 每个 subtopic 生成的 profile 数量
+  profiles_per_subtopic: 3
+  # 学生背景类型
+  background_types:
+    - "beginner"        # 初学者，几乎没有相关背景
+    - "intermediate"    # 有一定基础，部分知识掌握
+    - "advanced"        # 基础扎实，想深入理解
+
+# 知识漏洞生成配置
+gap_generation:
+  # 每个 profile 生成的知识漏洞数量
+  gaps_per_profile: 3
+  # 漏洞类型分布
+  severity_levels:
+    - name: "misconception"    # 存在错误理解
+      weight: 0.3
+    - name: "incomplete"       # 理解不完整/片面
+      weight: 0.4
+    - name: "missing"          # 完全缺失某知识点
+      weight: 0.3
+
+# Task 生成配置
+task_generation:
+  # 每个 (profile + gaps) 生成的 task 数量
+  tasks_per_combo: 2
+  # Task 类型
+  task_types:
+    - name: "concept_understanding"  # 想弄懂某个概念
+      weight: 0.3
+    - name: "problem_solving"        # 想做对某类题目
+      weight: 0.3
+    - name: "application"            # 想知道如何应用
+      weight: 0.2
+    - name: "comparison"             # 想区分易混淆概念
+      weight: 0.2
+
+# RAG 查询配置（用于从 KB 中提取知识范围）
+rag_query:
+  # 查询模式
+  mode: "naive"
+  # 用于探测 KB 内容的种子查询
+  seed_queries:
+    - "这部分内容的主要知识点和核心概念有哪些？"
+    - "这部分内容涉及哪些关键定理、公式或方法？"
+    - "这部分内容有哪些典型的应用场景和例题？"
+
+# LLM 配置（留空则使用系统默认 LLM 配置）
+llm:
+  temperature: 0.7
+  max_tokens: 4096
+
+# 输出配置
+output:
+  # 输出目录
+  output_dir: "./benchmark/data/generated"
+  # 输出格式
+  format: "jsonl"  # jsonl / json
+  # 是否保存中间结果
+  save_intermediate: true
