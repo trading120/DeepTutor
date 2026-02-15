@@ -3,7 +3,7 @@
 Profile Generator - Generate realistic student profiles
 
 Creates diverse student profiles with varying backgrounds, knowledge states,
-and learning characteristics based on a knowledge scope description.
+and personalities based on a knowledge scope description.
 """
 
 import json
@@ -28,7 +28,13 @@ async def generate_profile(
         profile_id: Optional specific profile ID
 
     Returns:
-        Student profile dictionary
+        Student profile dictionary with fields:
+        - profile_id
+        - education_background (single string)
+        - learning_purpose
+        - knowledge_state: {known_well, partially_known, unknown}
+        - personality (single paragraph)
+        - source_kb
     """
     kb_name = knowledge_scope.get("source_kb", "unknown")
     logger.info(f"Generating {background_type} profile for KB: {kb_name}")
@@ -57,7 +63,6 @@ async def generate_profile(
     elif "profile_id" not in result:
         result["profile_id"] = f"profile_{background_type}"
 
-    result["background_type"] = background_type
     result["source_kb"] = kb_name
 
     return result

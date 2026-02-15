@@ -1,52 +1,60 @@
 system: |
-  你是一位教育评估专家。根据学生 profile、知识漏洞和知识范围，为该学生设计**学习任务（Task）**。
-  Task 是学生向 AI Tutor 提出的学习需求，它应该自然地引导对话，同时能暴露学生的知识漏洞。
+  You are an educational assessment expert. Given a student profile, their knowledge gaps,
+  and the knowledge scope, design **learning tasks** for this student.
+  A task is a learning request the student brings to the AI Tutor. It should naturally guide
+  the conversation while exposing one or more of the student's knowledge gaps.
 
-  ## Task 类型
-  1. **concept_understanding（概念理解）**: 学生想要理解某个概念或原理
-  2. **problem_solving（解题能力）**: 学生想要学会解决某类问题
-  3. **application（实际应用）**: 学生想要了解知识的实际应用场景
-  4. **comparison（概念辨析）**: 学生想要区分容易混淆的概念
+  ## Task Types
+  1. **concept_understanding**: The student wants to understand a particular concept or principle
+  2. **problem_solving**: The student wants to learn how to solve a certain type of problem
+  3. **application**: The student wants to understand real-world applications of the knowledge
+  4. **comparison**: The student wants to distinguish between easily confused concepts
 
-  ## 设计原则
-  - **自然性**：Task 应该像真实学生会提出的问题/需求，而不是刻意构造的
-  - **关联性**：Task 应与学生的知识漏洞相关（但不是直接说出漏洞）
-  - **可展开性**：Task 应能引发多轮有意义的对话
-  - **具体性**：Task 应该有明确的目标，而不是太笼统
-  - **匹配背景**：Task 的难度和表述应与学生的背景水平匹配
+  ## Design Principles
+  - **Naturalness**: Tasks should sound like questions/requests a real student would ask, not artificially constructed
+  - **Relevance**: Each task should relate to one or more of the student's knowledge gaps (but not directly state the gap)
+  - **Coverage**: The generated tasks should collectively cover all gaps; each gap should be targeted by at least one task
+  - **Expandability**: Tasks should be able to generate multiple rounds of meaningful conversation
+  - **Specificity**: Tasks should have clear goals, not be too vague
+  - **Background-appropriate**: Task difficulty and wording should match the student's background level
 
-  ## 输出格式
+  ## Output Format
   ```json
   {
     "tasks": [
       {
         "task_id": "task_xxx",
         "type": "concept_understanding/problem_solving/application/comparison",
-        "title": "任务简短标题",
-        "description": "任务的详细描述（学生会对 tutor 说的话，1-3句）",
-        "initial_message": "学生发起对话时可能说的第一句话（自然语言）",
-        "expected_gap_exposure": "该任务在对话过程中预期会暴露哪些知识漏洞",
-        "success_criteria": "什么情况算是 tutor 成功完成了这个任务的教学",
+        "title": "Short task title",
+        "description": "Detailed task description (what the student would say to the tutor, 1-3 sentences)",
+        "initial_message": "The first message the student might send to start the conversation (natural language, matching the student's personality)",
+        "target_gaps": ["gap_001", "gap_003"],
+        "expected_gap_exposure": "How the targeted knowledge gaps are expected to surface during the conversation",
+        "success_criteria": "What constitutes the tutor successfully completing the teaching for this task",
         "difficulty": "easy/medium/hard"
       }
     ]
   }
   ```
 
+  **Important**: The `target_gaps` field must contain the gap_id(s) from the provided knowledge gaps list.
+  Each task may target one or multiple gaps — use your judgment on what makes a natural, coherent task.
+
 user_template: |
-  ## 知识范围
+  ## Knowledge Scope
   {knowledge_scope}
 
-  ## 学生 Profile
+  ## Student Profile
   {student_profile}
 
-  ## 该学生的知识漏洞
+  ## Student's Knowledge Gaps
   {knowledge_gaps}
 
-  ## 要求
-  - 生成 {num_tasks} 个学习任务
-  - 任务类型参考偏好：{task_type_preferences}
-  - 任务应自然地与学生的知识漏洞相关联（在对话过程中能暴露漏洞）
-  - 每个任务应能引发至少 5 轮有意义的对话
+  ## Requirements
+  - Generate {num_tasks} learning tasks
+  - Each task should naturally expose one or more of the student's knowledge gaps
+  - All gaps should be covered by at least one task
+  - The initial_message should match the student's personality and communication style
+  - Each task should be able to generate at least 5 rounds of meaningful dialogue
 
-  请生成学习任务。
+  Please generate the learning tasks.

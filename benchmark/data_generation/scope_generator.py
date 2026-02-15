@@ -40,9 +40,9 @@ async def query_kb_for_content(
 
     if seed_queries is None:
         seed_queries = [
-            "这部分内容的主要知识点和核心概念有哪些？",
-            "这部分内容涉及哪些关键定理、公式或方法？",
-            "这部分内容有哪些典型的应用场景和例题？",
+            "What are the main knowledge points and core concepts in this content?",
+            "What key theorems, formulas, or methods does this content cover?",
+            "What are typical application scenarios and example problems in this content?",
         ]
 
     service = RAGService(kb_base_dir=kb_base_dir)
@@ -57,7 +57,7 @@ async def query_kb_for_content(
             )
             content = result.get("content", result.get("answer", ""))
             if content and content.strip():
-                all_contents.append(f"--- 查询: {query} ---\n{content}")
+                all_contents.append(f"--- Query: {query} ---\n{content}")
         except Exception as e:
             logger.warning(f"Failed to query KB '{kb_name}' with '{query[:30]}...': {e}")
 

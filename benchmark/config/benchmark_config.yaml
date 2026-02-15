@@ -1,74 +1,75 @@
 # =============================================================================
 # Benchmark Configuration - Tutor Evaluation Data Generation
 # =============================================================================
-# 本配置用于从已有的 per-subtopic 知识库生成评测数据。
-# subtopic 已人为拆分好，每个 topic 对应一个已构建的 RAG 知识库。
+# This config is used to generate evaluation data from existing per-subtopic
+# knowledge bases. Subtopics have been manually split, each topic corresponds
+# to a pre-built RAG knowledge base.
 
-# 知识库配置
+# Knowledge base configuration
 knowledge_bases:
-  # 知识库基础目录（会被 main.yaml 中的 paths.knowledge_bases_dir 覆盖）
+  # Base directory for knowledge bases (may be overridden by main.yaml paths.knowledge_bases_dir)
   base_dir: "./data/knowledge_bases"
-  # 要处理的知识库名称列表（留空则自动发现所有已注册的知识库）
+  # List of KB names to process (empty = auto-discover all registered KBs)
   kb_names: []
 
-# Profile 生成配置
+# Profile generation configuration
 profile_generation:
-  # 每个 subtopic 生成的 profile 数量
+  # Number of profiles to generate per subtopic
   profiles_per_subtopic: 3
-  # 学生背景类型
+  # Student background types
   background_types:
-    - "beginner"        # 初学者，几乎没有相关背景
-    - "intermediate"    # 有一定基础，部分知识掌握
-    - "advanced"        # 基础扎实，想深入理解
+    - "beginner"        # Novice, almost no relevant background
+    - "intermediate"    # Some foundation, partial knowledge
+    - "advanced"        # Solid foundation, wants deeper understanding
 
-# 知识漏洞生成配置
+# Knowledge gap generation configuration
 gap_generation:
-  # 每个 profile 生成的知识漏洞数量
+  # Number of knowledge gaps per profile
   gaps_per_profile: 3
-  # 漏洞类型分布
+  # Gap type distribution
   severity_levels:
-    - name: "misconception"    # 存在错误理解
+    - name: "misconception"    # Has incorrect understanding
       weight: 0.3
-    - name: "incomplete"       # 理解不完整/片面
+    - name: "incomplete"       # Partial / one-sided understanding
       weight: 0.4
-    - name: "missing"          # 完全缺失某知识点
+    - name: "missing"          # Completely missing a knowledge point
       weight: 0.3
 
-# Task 生成配置
+# Task generation configuration
 task_generation:
-  # 每个 (profile + gaps) 生成的 task 数量
+  # Number of tasks per (profile + gaps) combination
   tasks_per_combo: 2
-  # Task 类型
+  # Task types
   task_types:
-    - name: "concept_understanding"  # 想弄懂某个概念
+    - name: "concept_understanding"  # Wants to understand a concept
       weight: 0.3
-    - name: "problem_solving"        # 想做对某类题目
+    - name: "problem_solving"        # Wants to solve a type of problem
       weight: 0.3
-    - name: "application"            # 想知道如何应用
+    - name: "application"            # Wants to know how to apply knowledge
       weight: 0.2
-    - name: "comparison"             # 想区分易混淆概念
+    - name: "comparison"             # Wants to distinguish confusable concepts
       weight: 0.2
 
-# RAG 查询配置（用于从 KB 中提取知识范围）
+# RAG query configuration (used to extract knowledge scope from KBs)
 rag_query:
-  # 查询模式
+  # Query mode
   mode: "naive"
-  # 用于探测 KB 内容的种子查询
+  # Seed queries for probing KB content
   seed_queries:
-    - "这部分内容的主要知识点和核心概念有哪些？"
-    - "这部分内容涉及哪些关键定理、公式或方法？"
-    - "这部分内容有哪些典型的应用场景和例题？"
+    - "What are the main knowledge points and core concepts in this content?"
+    - "What key theorems, formulas, or methods does this content cover?"
+    - "What are typical application scenarios and example problems in this content?"
 
-# LLM 配置（留空则使用系统默认 LLM 配置）
+# LLM configuration (leave empty to use system default LLM config)
 llm:
   temperature: 0.7
   max_tokens: 4096
 
-# 输出配置
+# Output configuration
 output:
-  # 输出目录
+  # Output directory
   output_dir: "./benchmark/data/generated"
-  # 输出格式
+  # Output format
   format: "jsonl"  # jsonl / json
-  # 是否保存中间结果
+  # Whether to save intermediate results
   save_intermediate: true

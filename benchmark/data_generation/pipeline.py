@@ -8,15 +8,21 @@ Orchestrates the full benchmark data generation from existing knowledge bases:
        │
        ▼  Stage 1: Discover KBs
        │
-       ▼  Stage 2: Query each KB → generate knowledge scope
+       ▼  Stage 2: Query each KB → generate knowledge scope (saved separately)
        │
        ▼  Stage 3: Generate student profiles (beginner/intermediate/advanced)
        │
        ▼  Stage 4: Generate knowledge gaps per profile
        │
-       ▼  Stage 5: Generate tasks per (profile, gaps) combo
+       ▼  Stage 5: Generate one task per gap → one benchmark entry per (profile, gap, task)
        │
-       ▼  Stage 6: Output benchmark dataset (JSONL)
+       ▼  Stage 6: Output benchmark entries (JSONL, no scope duplication)
+
+Output structure:
+  benchmark/data/generated/
+  ├── knowledge_scopes/
+  │   └── {kb_name}.json           # knowledge scope per KB
+  └── benchmark_{timestamp}.jsonl  # evaluation entries (profile + gap + task)
 """
 
 import asyncio
@@ -44,6 +50,10 @@ class DataGenerationPipeline:
 
     Assumes subtopics have already been split and each topic has its own
     RAG knowledge base ready to query.
+
+    Output:
+        - knowledge_scopes/{kb_name}.json  — scope reference (not used in evaluation)
+        - benchmark_{timestamp}.jsonl      — one entry per (profile, gap, task) triple
 
     Usage:
         pipeline = DataGenerationPipeline()
@@ -74,6 +84,10 @@ class DataGenerationPipeline:
             self.output_dir = PROJECT_ROOT / self.output_dir
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
+        # Knowledge scopes directory (separate from entries)
+        self.scopes_dir = self.output_dir / "knowledge_scopes"
+        self.scopes_dir.mkdir(parents=True, exist_ok=True)
+
         # KB base directory
         kb_cfg = self.config.get("knowledge_bases", {})
         self.kb_base_dir = kb_cfg.get("base_dir", "./data/knowledge_bases")
@@ -82,9 +96,9 @@ class DataGenerationPipeline:
 
         # Pipeline state
         self.kb_names: list[str] = []
-        self.knowledge_scopes: dict[str, dict] = {}   # kb_name → scope
-        self.profiles: dict[str, list[dict]] = {}      # kb_name → [profile]
-        self.gaps: dict[str, dict[str, list[dict]]] = {}  # kb_name → {pid → [gap]}
+        self.knowledge_scopes: dict[str, dict] = {}       # kb_name → scope
+        self.profiles: dict[str, list[dict]] = {}          # kb_name → [profile]
+        self.gaps: dict[str, dict[str, list[dict]]] = {}   # kb_name → {pid → [gap]}
         self.benchmark_entries: list[dict] = []
 
         # Configure logging
@@ -154,7 +168,7 @@ class DataGenerationPipeline:
         logger.info(f"Processing KB: {kb_name}")
         logger.info(f"{'='*50}")
 
-        # Stage 2: Generate knowledge scope
+        # Stage 2: Generate knowledge scope → saved to separate file
         logger.info(f"[Stage 2] Generating knowledge scope for '{kb_name}'...")
         rag_cfg = self.config.get("rag_query", {})
         try:
@@ -165,6 +179,13 @@ class DataGenerationPipeline:
                 kb_base_dir=self.kb_base_dir,
             )
             self.knowledge_scopes[kb_name] = scope
+
+            # Save scope to its own file (reference only, not used in evaluation)
+            scope_file = self.scopes_dir / f"{kb_name}.json"
+            with open(scope_file, "w", encoding="utf-8") as f:
+                json.dump(scope, f, ensure_ascii=False, indent=2)
+            logger.info(f"  Knowledge scope saved → {scope_file}")
+
         except Exception as e:
             logger.error(f"Failed to generate scope for '{kb_name}': {e}")
             return
@@ -196,14 +217,10 @@ class DataGenerationPipeline:
         )
         self.gaps[kb_name] = profile_gaps
 
-        # Stage 5: Generate tasks
+        # Stage 5: Generate tasks per profile → one entry per task
         logger.info(f"[Stage 5] Generating tasks for '{kb_name}'...")
         task_cfg = self.config.get("task_generation", {})
-        task_type_config = [
-            {"name": t["name"], "weight": t["weight"]}
-            for t in task_cfg.get("task_types", [])
-        ] or None
-        tasks_per_combo = task_cfg.get("tasks_per_combo", 2)
+        tasks_per_profile = task_cfg.get("tasks_per_combo", 2)
 
         for profile in profiles:
             profile_id = profile.get("profile_id", "unknown")
@@ -218,17 +235,23 @@ class DataGenerationPipeline:
                     knowledge_scope=scope,
                     student_profile=profile,
                     knowledge_gaps=gaps,
-                    num_tasks=tasks_per_combo,
-                    task_type_config=task_type_config,
+                    num_tasks=tasks_per_profile,
                 )
 
-                # Create benchmark entries: one per task
+                # Build gap lookup for resolving target_gaps
+                gap_by_id = {g["gap_id"]: g for g in gaps if "gap_id" in g}
+
                 for task in tasks:
+                    task_id = task.get("task_id", "unknown")
+                    # Resolve target_gaps from IDs to full gap objects
+                    target_gap_ids = task.get("target_gaps", [])
+                    target_gaps = [gap_by_id[gid] for gid in target_gap_ids if gid in gap_by_id]
+
                     entry = {
+                        "entry_id": f"{kb_name}_{profile_id}_{task_id}",
                         "kb_name": kb_name,
-                        "knowledge_scope": scope,
                         "profile": profile,
-                        "gaps": gaps,
+                        "gaps": target_gaps,
                         "task": task,
                     }
                     self.benchmark_entries.append(entry)
@@ -236,7 +259,7 @@ class DataGenerationPipeline:
             except Exception as e:
                 logger.error(f"Failed to generate tasks for {profile_id}: {e}")
 
-        # Save intermediate per-KB result
+        # Save intermediate per-KB result (includes scope for debugging)
         if self.config["output"].get("save_intermediate", True):
             self._save_intermediate(
                 f"kb_{kb_name}.json",
@@ -257,23 +280,28 @@ class DataGenerationPipeline:
         logger.info(f"Completed KB '{kb_name}': {len(profiles)} profiles, {kb_entries} entries")
 
     async def _stage_output(self, timestamp: str):
-        """Stage 6: Save final output."""
+        """Stage 6: Save final output — one pretty-printed JSON per entry."""
         logger.info("[Stage 6] Saving benchmark dataset...")
 
-        output_format = self.config["output"].get("format", "jsonl")
-        output_file = self.output_dir / f"benchmark_{timestamp}.{output_format}"
+        # Create entries directory for this run
+        entries_dir = self.output_dir / f"benchmark_{timestamp}"
+        entries_dir.mkdir(parents=True, exist_ok=True)
 
-        if output_format == "jsonl":
-            with open(output_file, "w", encoding="utf-8") as f:
-                for entry in self.benchmark_entries:
-                    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-        elif output_format == "json":
-            with open(output_file, "w", encoding="utf-8") as f:
-                json.dump(self.benchmark_entries, f, ensure_ascii=False, indent=2)
-        else:
-            raise ValueError(f"Unknown output format: {output_format}")
+        # Save each entry as a separate, human-readable JSON file
+        for entry in self.benchmark_entries:
+            entry_id = entry.get("entry_id", "unknown")
+            entry_file = entries_dir / f"{entry_id}.json"
+            with open(entry_file, "w", encoding="utf-8") as f:
+                json.dump(entry, f, ensure_ascii=False, indent=2)
 
-        logger.info(f"Saved {len(self.benchmark_entries)} entries → {output_file}")
+        logger.info(f"Saved {len(self.benchmark_entries)} entries → {entries_dir}/")
+
+        # Also save a combined JSONL for programmatic use
+        combined_file = entries_dir / "_all_entries.jsonl"
+        with open(combined_file, "w", encoding="utf-8") as f:
+            for entry in self.benchmark_entries:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        logger.info(f"Combined JSONL → {combined_file}")
 
         # Summary
         summary = {
@@ -293,10 +321,11 @@ class DataGenerationPipeline:
                     for kb in self.kb_names
                 ],
             },
-            "output_file": str(output_file),
+            "entries_dir": str(entries_dir),
+            "knowledge_scopes_dir": str(self.scopes_dir),
         }
 
-        summary_file = self.output_dir / f"summary_{timestamp}.json"
+        summary_file = entries_dir / "_summary.json"
         with open(summary_file, "w", encoding="utf-8") as f:
             json.dump(summary, f, ensure_ascii=False, indent=2)
 

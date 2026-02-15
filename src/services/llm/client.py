@@ -241,51 +241,87 @@ class LLMClient:
             messages: Optional[List[Dict]] = None,
             **kwargs: Any,
         ):
-            # Handle multimodal messages
+            # NOTE: openai_complete_if_cache does NOT accept 'messages' as a named parameter.
+            # It builds its own messages array internally from (system_prompt, history_messages, prompt)
+            # and passes **kwargs through to chat.completions.create().
+            # If we put 'messages' in kwargs, it causes "multiple values for keyword argument 'messages'".
+            #
+            # Solution: pass multimodal content via the 'prompt' parameter.
+            # openai_complete_if_cache does: messages.append({"role": "user", "content": prompt})
+            # If prompt is a list (multimodal content parts), this creates the correct format.
+
+            # #region agent log
+            import json as _json; open("/Users/howard/Documents/forks/.cursor/debug.log","a").write(_json.dumps({"hypothesisId":"H1","location":"client.py:vision_model_func","message":"vision_model_func called","data":{"has_messages":bool(messages),"has_image_data":bool(image_data),"prompt_type":type(prompt).__name__,"prompt_preview":str(prompt)[:100]},"timestamp":__import__("time").time()})+"\n")
+            # #endregion
+
+            # Handle multimodal messages (pre-built message array from RAG-Anything)
             if messages:
+                # Extract content from the user message to pass as prompt
+                user_content = None
+                sys_content = None
+                for msg in messages:
+                    if msg["role"] == "user":
+                        user_content = msg["content"]
+                    elif msg["role"] == "system":
+                        sys_content = msg["content"]
+
                 clean_kwargs = {
                     k: v
                     for k, v in kwargs.items()
                     if k not in ["messages", "prompt", "system_prompt", "history_messages"]
                 }
                 lightrag_kwargs = {
-                    "messages": messages,
+                    "system_prompt": sys_content,
+                    "history_messages": [],
                     "api_key": self.config.api_key,
                     "base_url": self.config.base_url,
                     **clean_kwargs,
                 }
                 if api_version:
                     lightrag_kwargs["api_version"] = api_version
+
+                # #region agent log
+                open("/Users/howard/Documents/forks/.cursor/debug.log","a").write(_json.dumps({"hypothesisId":"H1","location":"client.py:vision_model_func:messages_branch","message":"passing multimodal content as prompt","data":{"user_content_type":type(user_content).__name__,"has_sys_content":bool(sys_content),"lightrag_kwargs_keys":list(lightrag_kwargs.keys())},"timestamp":__import__("time").time()})+"\n")
+                # #endregion
+
                 return openai_complete_if_cache(
                     self.config.model,
-                    prompt="",
+                    prompt=user_content,  # Pass multimodal content list as prompt
                     **lightrag_kwargs,
                 )
 
-            # Handle image data
+            # Handle image data (base64 encoded)
             if image_data:
-                # Build image message
-                image_message = {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/jpeg;base64,{image_data}"},
-                        },
-                    ],
+                # Build multimodal content list
+                multimodal_content = [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{image_data}"},
+                    },
+                ]
+                clean_kwargs = {
+                    k: v
+                    for k, v in kwargs.items()
+                    if k not in ["messages", "prompt", "system_prompt", "history_messages"]
                 }
                 lightrag_kwargs = {
-                    "messages": [image_message],
+                    "system_prompt": None,
+                    "history_messages": [],
                     "api_key": self.config.api_key,
                     "base_url": self.config.base_url,
-                    **kwargs,
+                    **clean_kwargs,
                 }
                 if api_version:
                     lightrag_kwargs["api_version"] = api_version
+
+                # #region agent log
+                open("/Users/howard/Documents/forks/.cursor/debug.log","a").write(_json.dumps({"hypothesisId":"H1","location":"client.py:vision_model_func:image_data_branch","message":"passing image content as prompt","data":{"lightrag_kwargs_keys":list(lightrag_kwargs.keys())},"timestamp":__import__("time").time()})+"\n")
+                # #endregion
+
                 return openai_complete_if_cache(
                     self.config.model,
-                    prompt="",
+                    prompt=multimodal_content,  # Pass multimodal content list as prompt
                     **lightrag_kwargs,
                 )
 

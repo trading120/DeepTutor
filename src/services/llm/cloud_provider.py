@@ -173,38 +173,38 @@ async def _openai_complete(
     if not supports_response_format(binding, model):
         kwargs.pop("response_format", None)
 
+    messages = kwargs.pop("messages", None)
+
     content = None
-    try:
-        # Try using lightrag's openai_complete_if_cache first (has caching)
-        # Only pass api_version if it's set (for Azure OpenAI)
-        # Standard OpenAI SDK doesn't accept api_version parameter
-        lightrag_kwargs = {
-            "system_prompt": system_prompt,
-            "history_messages": [],  # Required by lightrag to build messages array
-            "api_key": api_key,
-            "base_url": base_url,
-            **kwargs,
-        }
-        if api_version:
-            lightrag_kwargs["api_version"] = api_version
-
-        # Suppress lightrag's and openai's internal error logging during the call
-        # (errors are handled by our fallback mechanism)
-        original_lightrag_level = _lightrag_logger.level
-        original_openai_level = _openai_logger.level
-        _lightrag_logger.setLevel(logging.CRITICAL)
-        _openai_logger.setLevel(logging.CRITICAL)
+    # When pre-built messages are provided, skip lightrag (it expects prompt+history, not messages)
+    # and use direct aiohttp call. Otherwise try lightrag first for caching.
+    if not messages:
         try:
-            # model and prompt must be positional arguments
-            openai_complete_if_cache = _get_openai_complete_if_cache()
-            content = await openai_complete_if_cache(model, prompt, **lightrag_kwargs)
-        finally:
-            _lightrag_logger.setLevel(original_lightrag_level)
-            _openai_logger.setLevel(original_openai_level)
-    except Exception:
-        pass  # Fall through to direct call
+            # Try using lightrag's openai_complete_if_cache first (has caching)
+            lightrag_kwargs = {
+                "system_prompt": system_prompt,
+                "history_messages": [],
+                "api_key": api_key,
+                "base_url": base_url,
+                **kwargs,
+            }
+            if api_version:
+                lightrag_kwargs["api_version"] = api_version
 
-    # Fallback: Direct aiohttp call
+            original_lightrag_level = _lightrag_logger.level
+            original_openai_level = _openai_logger.level
+            _lightrag_logger.setLevel(logging.CRITICAL)
+            _openai_logger.setLevel(logging.CRITICAL)
+            try:
+                openai_complete_if_cache = _get_openai_complete_if_cache()
+                content = await openai_complete_if_cache(model, prompt, **lightrag_kwargs)
+            finally:
+                _lightrag_logger.setLevel(original_lightrag_level)
+                _openai_logger.setLevel(original_openai_level)
+        except Exception:
+            pass  # Fall through to direct call
+
+    # Direct aiohttp call (used when messages provided, or as fallback)
     if not content and base_url:
         # Build URL using unified utility (use binding for Azure detection)
         url = build_chat_url(base_url, api_version, binding)
@@ -212,12 +212,18 @@ async def _openai_complete(
         # Build headers using unified utility
         headers = build_auth_headers(api_key, binding)
 
-        data = {
-            "model": model,
-            "messages": [
+        # Use pre-built messages when provided; otherwise build from prompt/system_prompt
+        if messages:
+            msg_list = messages
+        else:
+            msg_list = [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt},
-            ],
+            ]
+
+        data = {
+            "model": model,
+            "messages": msg_list,
             "temperature": get_effective_temperature(
                 binding, model, kwargs.get("temperature", 0.7)
             ),
