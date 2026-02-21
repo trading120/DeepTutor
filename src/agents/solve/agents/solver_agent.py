@@ -16,9 +16,8 @@ from typing import Any
 from src.agents.base_agent import BaseAgent
 
 from ..memory.scratchpad import PlanStep, Scratchpad
+from ..tools import ToolRegistry
 from ..utils.json_utils import extract_json_from_text
-
-VALID_ACTIONS = {"rag_search", "web_search", "code_execute", "done", "replan"}
 
 
 class SolverAgent(BaseAgent):
@@ -32,6 +31,7 @@ class SolverAgent(BaseAgent):
         api_version: str | None = None,
         token_tracker: Any | None = None,
         language: str = "en",
+        tool_registry: ToolRegistry | None = None,
     ) -> None:
         super().__init__(
             module_name="solve",
@@ -43,6 +43,7 @@ class SolverAgent(BaseAgent):
             token_tracker=token_tracker,
             language=language,
         )
+        self._tool_registry = tool_registry or ToolRegistry.create_default(language)
 
     async def process(
         self,
@@ -78,20 +79,21 @@ class SolverAgent(BaseAgent):
     # ------------------------------------------------------------------
 
     def _build_system_prompt(self) -> str:
+        tools_desc = self._tool_registry.build_solver_description()
+
         prompt = self.get_prompt("system") if self.has_prompts() else None
         if prompt:
-            return prompt
+            try:
+                return prompt.format(tools_description=tools_desc)
+            except KeyError:
+                return prompt
+
         # Fallback
         return (
             "You are a ReAct problem-solving agent. For the current step, decide what "
             "action to take next. Output strict JSON with keys: thought, action, "
             "action_input, self_note.\n\n"
-            "Available actions:\n"
-            "- rag_search: search the knowledge base. action_input = query string\n"
-            "- web_search: search the web. action_input = query string\n"
-            "- code_execute: run Python code. action_input = what to compute\n"
-            "- done: current step has enough information. action_input = \"\"\n"
-            "- replan: the plan needs revision. action_input = reason\n\n"
+            f"Available actions:\n{tools_desc}\n\n"
             "self_note: write a 1-sentence summary of what you learned this round."
         )
 
@@ -146,7 +148,7 @@ class SolverAgent(BaseAgent):
             }
 
         action = str(data.get("action", "done")).strip().lower()
-        if action not in VALID_ACTIONS:
+        if action not in self._tool_registry.valid_actions:
             action = "done"
 
         return {

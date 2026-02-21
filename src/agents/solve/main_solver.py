@@ -23,6 +23,7 @@ from ...services.config import parse_language
 from ...services.path_service import get_path_service
 from .agents import PlannerAgent, SolverAgent, WriterAgent
 from .memory import Scratchpad, Source
+from .tools import ToolRegistry
 from .utils.display_manager import get_display_manager
 from .utils.token_tracker import TokenTracker
 
@@ -39,6 +40,8 @@ class MainSolver:
         language: str | None = None,
         kb_name: str = "ai-textbook",
         output_base_dir: str | None = None,
+        tool_registry: ToolRegistry | None = None,
+        disable_memory: bool = False,
     ) -> None:
         # Store init params for ainit()
         self._config_path = config_path
@@ -48,6 +51,8 @@ class MainSolver:
         self._language = language
         self._kb_name = kb_name
         self._output_base_dir = output_base_dir
+        self._external_tool_registry = tool_registry
+        self.disable_memory = disable_memory
 
         # Will be set in ainit()
         self.config: dict[str, Any] = {}
@@ -185,6 +190,10 @@ class MainSolver:
     def _init_agents(self) -> None:
         """Create the three agents."""
         lang = parse_language(self.config.get("system", {}).get("language", "en"))
+        self.tool_registry = (
+            self._external_tool_registry
+            or ToolRegistry.create_default(language=lang)
+        )
         common = dict(
             config=self.config,
             api_key=self.api_key,
@@ -193,10 +202,12 @@ class MainSolver:
             token_tracker=self.token_tracker,
             language=lang,
         )
-        self.planner_agent = PlannerAgent(**common)
-        self.solver_agent = SolverAgent(**common)
+        self.planner_agent = PlannerAgent(**common, tool_registry=self.tool_registry)
+        self.solver_agent = SolverAgent(**common, tool_registry=self.tool_registry)
         self.writer_agent = WriterAgent(**common)
-        self.logger.info(f"Agents initialised: PlannerAgent, SolverAgent, WriterAgent (lang={lang})")
+        self.logger.info(
+            f"Agents initialised (lang={lang}), tools registered: {self.tool_registry.tool_names}"
+        )
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -293,11 +304,15 @@ class MainSolver:
         if hasattr(self, "_send_progress_update"):
             self._send_progress_update("plan", {"status": "planning"})
 
+        memory_ctx = ""
+        if not self.disable_memory:
+            memory_ctx = await self._get_planner_memory_context(question)
+
         plan = await self.planner_agent.process(
             question=question,
             scratchpad=scratchpad,
             kb_name=self.kb_name,
-            memory_context=await self._get_planner_memory_context(question),
+            memory_context=memory_ctx,
         )
         scratchpad.set_plan(plan)
         scratchpad.save(output_dir)
@@ -334,7 +349,9 @@ class MainSolver:
 
             scratchpad.mark_step_status(step.id, "in_progress")
             self.logger.info(f"  Step {step.id}: {step.goal}")
-            step_memory_context = await self._get_solver_memory_context(step.goal)
+            step_memory_context = ""
+            if not self.disable_memory:
+                step_memory_context = await self._get_solver_memory_context(step.goal)
 
             # Compute step index for progress reporting
             step_index = next(
@@ -395,12 +412,15 @@ class MainSolver:
                     if replan_count <= max_replans:
                         if self.logger.display_manager:
                             self.logger.display_manager.set_agent_status("PlannerAgent", "running")
+                        replan_memory = ""
+                        if not self.disable_memory:
+                            replan_memory = await self._get_planner_memory_context(question)
                         new_plan = await self.planner_agent.process(
                             question=question,
                             scratchpad=scratchpad,
                             kb_name=self.kb_name,
                             replan=True,
-                            memory_context=await self._get_planner_memory_context(question),
+                            memory_context=replan_memory,
                         )
                         scratchpad.update_plan(new_plan)
                         scratchpad.save(output_dir)
@@ -460,7 +480,7 @@ class MainSolver:
         language = self.config.get("system", {}).get("language", "en")
         lang_code = parse_language(language)
 
-        preference = self._get_user_preference()
+        preference = "" if self.disable_memory else self._get_user_preference()
 
         if detailed:
             final_answer = await self.writer_agent.process_iterative(
@@ -487,8 +507,8 @@ class MainSolver:
         self.logger.success(f"Final answer saved: {answer_file}")
         self.logger.update_token_stats(self.token_tracker.get_summary())
 
-        # Publish event for personalisation
-        await self._publish_event(question, final_answer, scratchpad, output_dir)
+        if not self.disable_memory:
+            await self._publish_event(question, final_answer, scratchpad, output_dir)
 
         return {
             "question": question,

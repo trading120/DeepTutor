@@ -16,15 +16,10 @@ from typing import Any
 from src.agents.base_agent import BaseAgent
 
 from ..memory.scratchpad import Plan, PlanStep, Scratchpad
+from ..tools import ToolRegistry
 from ..utils.json_utils import extract_json_from_text
 
 logger = logging.getLogger(__name__)
-
-# Tools description injected into the prompt
-TOOLS_DESCRIPTION = """\
-- rag_search: Search the uploaded knowledge base (textbooks, lecture notes, etc.)
-- web_search: Search the internet for external information
-- code_execute: Execute Python code in a sandbox (calculations, plotting, data processing)"""
 
 _MAX_CHARS_PER_RETRIEVAL = 2000
 _MAX_AGGREGATE_INPUT_CHARS = 6000
@@ -42,6 +37,7 @@ class PlannerAgent(BaseAgent):
         api_version: str | None = None,
         token_tracker: Any | None = None,
         language: str = "en",
+        tool_registry: ToolRegistry | None = None,
     ) -> None:
         super().__init__(
             module_name="solve",
@@ -53,6 +49,7 @@ class PlannerAgent(BaseAgent):
             token_tracker=token_tracker,
             language=language,
         )
+        self._tool_registry = tool_registry or ToolRegistry.create_default(language)
 
     async def process(
         self,
@@ -280,12 +277,7 @@ class PlannerAgent(BaseAgent):
                     parts.append(f"\nReplan reason: {last.action_input}")
             scratchpad_summary = "\n".join(parts)
 
-        tools_desc = TOOLS_DESCRIPTION
-        if kb_name:
-            tools_desc = tools_desc.replace(
-                "the uploaded knowledge base",
-                f'the knowledge base "{kb_name}"',
-            )
+        tools_desc = self._tool_registry.build_planner_description(kb_name=kb_name)
 
         if template:
             return template.format(

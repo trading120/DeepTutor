@@ -31,7 +31,7 @@ Memory:   Scratchpad (统一记忆体：Plan + Entries + Sources + Metadata)
 |-----------|------|---------|----------|
 | **system_prompt** | `prompts/en/planner_agent.yaml → system` | 角色定义 + 规则 + 输出格式 (JSON) | 静态 |
 | **user_prompt → {question}** | `MainSolver.solve(question)` 传入 | 用户原始问题，完整文本 | 动态 |
-| **user_prompt → {tools_description}** | `TOOLS_DESCRIPTION` 常量 + kb_name 替换 | 3 个工具的文本描述 (rag_search / web_search / code_execute) | 半静态 |
+| **user_prompt → {tools_description}** | `ToolRegistry.build_planner_description()` 动态组合 | 根据注册的工具生成描述 (默认: rag_search / web_search / code_execute) | 动态 |
 | **user_prompt → {scratchpad_summary}** | `Scratchpad` 状态 | 首次："(initial plan — no progress yet)"；replan 时：各步骤状态 + self_note 汇总 + replan reason | 动态 |
 
 ### 1.3 Prompt 模板

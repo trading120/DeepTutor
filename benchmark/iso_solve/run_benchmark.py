@@ -14,7 +14,11 @@ Usage examples (run from project root with the hkuds conda env):
   # Direct LLM mode (fast), 50 random samples, all subjects:
   python -m benchmark.iso_solve.run_benchmark --mode direct --limit 50
 
-  # Full pipeline mode, algebra only, Level 1-3:
+  # Full pipeline mode (Plan→ReAct→Write), code_execute only, 20 samples:
+  python -m benchmark.iso_solve.run_benchmark --mode pipeline \
+      --tools code_execute --limit 20
+
+  # Pipeline mode with all tools, algebra only, Level 1-3:
   python -m benchmark.iso_solve.run_benchmark --mode pipeline \
       --subjects Algebra --levels 1 2 3 --limit 20
 
@@ -23,7 +27,7 @@ Usage examples (run from project root with the hkuds conda env):
       --dataroot benchmark/iso_solve/data/competition_math.parquet --limit 50
 
   # With config file:
-  python -m benchmark.iso_solve.run_benchmark --mode direct \
+  python -m benchmark.iso_solve.run_benchmark --mode pipeline \
       --config benchmark/iso_solve/config.yaml
 """
 
@@ -56,7 +60,9 @@ load_dotenv(_PROJECT_ROOT / ".env", override=False)
 from benchmark.iso_solve.answer_utils import (
     check_answer,
     extract_answer,
+    extract_answer_with_llm,
     is_equiv,
+    judge_answer_with_llm,
     last_boxed_only_string,
     remove_boxed,
 )
@@ -335,10 +341,36 @@ DIRECT_SYSTEM_PROMPT = (
 )
 
 
+async def _judge(
+    question: str,
+    predicted: str | None,
+    ground_truth: str | None,
+    use_llm: bool,
+) -> bool:
+    """Compare predicted vs ground_truth.
+
+    When *use_llm* is True, delegates to ``judge_answer_with_llm`` which
+    understands mathematical equivalence beyond surface-level string matching.
+    Otherwise falls back to the classic ``is_equiv`` normalised comparison.
+    """
+    if predicted is None or ground_truth is None:
+        return False
+
+    if use_llm:
+        return await judge_answer_with_llm(question, predicted, ground_truth)
+
+    try:
+        return is_equiv(predicted, ground_truth)
+    except Exception:
+        return predicted.strip() == ground_truth.strip()
+
+
 async def eval_direct(
     problem: MathProblem,
     temperature: float = 0.0,
     max_tokens: int = 4096,
+    use_llm_extract: bool = False,
+    use_llm_judge: bool = False,
 ) -> EvalResult:
     """Evaluate a single problem using direct LLM call."""
     from src.services.llm import complete
@@ -359,13 +391,16 @@ async def eval_direct(
             max_tokens=max_tokens,
         )
         elapsed = time.time() - t0
+
         predicted = extract_answer(response)
-        correct = False
-        if predicted is not None and gt is not None:
-            try:
-                correct = is_equiv(predicted, gt)
-            except Exception:
-                correct = predicted.strip() == gt.strip()
+        if use_llm_extract:
+            predicted = await extract_answer_with_llm(
+                problem.problem, response,
+            )
+
+        correct = await _judge(
+            problem.problem, predicted, gt, use_llm_judge,
+        )
 
         return EvalResult(
             problem=problem,
@@ -392,34 +427,73 @@ async def eval_direct(
 # Evaluation — Full Pipeline mode
 # ======================================================================
 
+def _build_pipeline_registry(
+    tools: list[str] | None,
+    language: str,
+) -> "ToolRegistry":
+    """Build a ToolRegistry for benchmark evaluation.
+
+    When *tools* is None, all default tools are loaded.
+    When *tools* is an explicit list (e.g. ["code_execute"]),
+    only those tools (plus the mandatory done/replan controls) are kept.
+    """
+    from src.agents.solve.tools import ToolRegistry
+
+    if tools is None:
+        return ToolRegistry.create_default(language=language)
+    return ToolRegistry.create_from_names(tools, language=language)
+
+
 async def eval_pipeline(
     problem: MathProblem,
     workspace: str,
     language: str = "en",
+    tools: list[str] | None = None,
+    use_llm_extract: bool = False,
+    use_llm_judge: bool = False,
 ) -> EvalResult:
-    """Evaluate a single problem using the full Plan → ReAct → Write pipeline."""
+    """Evaluate a single problem using the Plan → ReAct → Write pipeline.
+
+    Args:
+        problem: The math problem to solve.
+        workspace: Directory for pipeline output artefacts.
+        language: Prompt language (``"en"`` or ``"zh"``).
+        tools: Explicit tool list (e.g. ``["code_execute"]``).
+               ``None`` loads all default tools.
+               ``done`` and ``replan`` are always available.
+        use_llm_extract: Use LLM to extract the predicted answer.
+        use_llm_judge: Use LLM to judge mathematical equivalence.
+    """
     from src.agents.solve import MainSolver
+
+    registry = _build_pipeline_registry(tools, language)
+    has_rag = registry.get("rag_search") is not None
 
     gt = problem.ground_truth
     t0 = time.time()
     try:
         solver = MainSolver(
-            kb_name="__benchmark__",
+            kb_name="" if not has_rag else "__benchmark__",
             language=language,
             output_base_dir=workspace,
+            tool_registry=registry,
+            disable_memory=True,
         )
         await solver.ainit()
         result = await solver.solve(problem.problem)
         elapsed = time.time() - t0
 
         final_answer = result.get("final_answer", "")
+
         predicted = extract_answer(final_answer)
-        correct = False
-        if predicted is not None and gt is not None:
-            try:
-                correct = is_equiv(predicted, gt)
-            except Exception:
-                correct = predicted.strip() == gt.strip()
+        if use_llm_extract:
+            predicted = await extract_answer_with_llm(
+                problem.problem, final_answer,
+            )
+
+        correct = await _judge(
+            problem.problem, predicted, gt, use_llm_judge,
+        )
 
         return EvalResult(
             problem=problem,
@@ -509,6 +583,21 @@ async def run_benchmark(args: argparse.Namespace) -> BenchmarkReport:
     temperature = bench_cfg.get("llm", {}).get("temperature", 0.0)
     max_tokens = bench_cfg.get("llm", {}).get("max_tokens", 4096)
     concurrency = bench_cfg.get("concurrency", 1)
+    use_llm_extract: bool = (
+        args.llm_extract
+        if args.llm_extract is not None
+        else bench_cfg.get("llm_extract", False)
+    )
+    use_llm_judge: bool = (
+        args.llm_judge
+        if args.llm_judge is not None
+        else bench_cfg.get("llm_judge", False)
+    )
+
+    if use_llm_extract:
+        logger.info("LLM answer extraction: ENABLED")
+    if use_llm_judge:
+        logger.info("LLM answer judging:    ENABLED")
 
     pipeline_workspace = str(output_dir / "pipeline_workspaces")
     t_start = time.time()
@@ -519,7 +608,13 @@ async def run_benchmark(args: argparse.Namespace) -> BenchmarkReport:
         async def _run_one(idx: int, prob: MathProblem) -> EvalResult:
             async with sem:
                 logger.info(f"[{idx+1}/{len(problems)}] Solving: {prob.problem[:80]}...")
-                r = await eval_direct(prob, temperature=temperature, max_tokens=max_tokens)
+                r = await eval_direct(
+                    prob,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    use_llm_extract=use_llm_extract,
+                    use_llm_judge=use_llm_judge,
+                )
                 status = "✓" if r.correct else ("✗" if not r.error else "ERR")
                 logger.info(
                     f"  {status} predicted={r.predicted_answer}  gt={r.ground_truth}  "
@@ -533,16 +628,45 @@ async def run_benchmark(args: argparse.Namespace) -> BenchmarkReport:
             report.add(r)
 
     elif args.mode == "pipeline":
-        for i, prob in enumerate(problems):
-            logger.info(f"[{i+1}/{len(problems)}] Solving (pipeline): {prob.problem[:80]}...")
-            ws = os.path.join(pipeline_workspace, f"prob_{i:04d}")
-            os.makedirs(ws, exist_ok=True)
-            r = await eval_pipeline(prob, workspace=ws)
-            status = "✓" if r.correct else ("✗" if not r.error else "ERR")
-            logger.info(
-                f"  {status} predicted={r.predicted_answer}  gt={r.ground_truth}  "
-                f"({r.elapsed_sec:.1f}s)"
-            )
+        pipeline_cfg = bench_cfg.get("pipeline", {})
+        pipeline_tools: list[str] | None = (
+            args.tools
+            or pipeline_cfg.get("tools")
+        )
+        pipeline_lang = pipeline_cfg.get("language", "en")
+        pipeline_concurrency = pipeline_cfg.get("concurrency", 1)
+
+        if pipeline_tools is not None:
+            logger.info(f"Pipeline tools: {pipeline_tools} (+ done, replan)")
+        else:
+            logger.info("Pipeline tools: all defaults")
+        logger.info(f"Pipeline concurrency: {pipeline_concurrency}")
+
+        sem = asyncio.Semaphore(pipeline_concurrency)
+
+        async def _run_pipeline_one(idx: int, prob: MathProblem) -> EvalResult:
+            async with sem:
+                logger.info(f"[{idx+1}/{len(problems)}] Solving (pipeline): {prob.problem[:80]}...")
+                ws = os.path.join(pipeline_workspace, f"prob_{idx:04d}")
+                os.makedirs(ws, exist_ok=True)
+                r = await eval_pipeline(
+                    prob,
+                    workspace=ws,
+                    language=pipeline_lang,
+                    tools=pipeline_tools,
+                    use_llm_extract=use_llm_extract,
+                    use_llm_judge=use_llm_judge,
+                )
+                status = "✓" if r.correct else ("✗" if not r.error else "ERR")
+                logger.info(
+                    f"  {status} predicted={r.predicted_answer}  gt={r.ground_truth}  "
+                    f"({r.elapsed_sec:.1f}s)"
+                )
+                return r
+
+        tasks = [_run_pipeline_one(i, p) for i, p in enumerate(problems)]
+        results = await asyncio.gather(*tasks)
+        for r in results:
             report.add(r)
     else:
         raise ValueError(f"Unknown mode: {args.mode}")
@@ -592,6 +716,19 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42, help="Random seed for sampling")
     parser.add_argument("--output", type=str, default=None, help="Output directory")
     parser.add_argument("--config", type=str, default=None, help="Path to benchmark config YAML")
+    parser.add_argument(
+        "--tools", nargs="+", default=None,
+        help="Pipeline mode: tools to enable (e.g. code_execute). "
+             "done/replan are always available. Omit to use all defaults.",
+    )
+    parser.add_argument(
+        "--llm-extract", action="store_true", default=None,
+        help="Use LLM to extract predicted answers (more accurate than regex).",
+    )
+    parser.add_argument(
+        "--llm-judge", action="store_true", default=None,
+        help="Use LLM to judge mathematical equivalence (more accurate than string matching).",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Load data only, no LLM calls")
     parser.add_argument("-v", "--verbose", action="store_true")
 

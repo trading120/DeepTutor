@@ -1,6 +1,11 @@
 # ======================================================================
 # MATH Benchmark Configuration
 # ======================================================================
+# python -m benchmark.iso_solve.run_benchmark --mode pipeline \
+#     --config benchmark/iso_solve/config.yaml --limit 5
+
+# python -m benchmark.iso_solve.run_benchmark --mode direct \
+#     --config benchmark/iso_solve/config.yaml --limit 5
 
 # --- Dataset ---
 # First run downloads from HuggingFace and caches locally.
@@ -18,7 +23,7 @@ filter:
   #   - 1
   #   - 2
   #   - 3
-  limit: 50                   # Max problems to evaluate (null = all 12498)
+  limit: null                 # Max problems to evaluate (null = all 12498)
   seed: 42                    # Random seed for sampling
 
 # --- LLM settings (for direct mode) ---
@@ -27,7 +32,26 @@ llm:
   max_tokens: 4096            # Max output tokens per problem
 
 # --- Concurrency (for direct mode) ---
-concurrency: 5                # Parallel LLM requests
+concurrency: 10                # Parallel LLM requests
+
+# --- Pipeline mode settings ---
+pipeline:
+  language: en                # Prompt language for pipeline agents
+  tools:                      # Tools available to the solver agent.
+    - code_execute            # Only code execution; no RAG / web search.
+                              # done and replan are always included.
+                              # Set to null or remove to enable all tools.
+  concurrency: 20              # Parallel pipeline runs (each uses ~10-20 LLM calls,
+                              # keep low to avoid API rate limits)
+
+# --- LLM-assisted evaluation ---
+llm_extract: true             # Use LLM to extract predicted answers from
+                              # model output (more accurate than regex).
+                              # Override with --llm-extract on the CLI.
+llm_judge: true               # Use LLM to judge mathematical equivalence
+                              # (ignores formatting differences like
+                              # "6,8,10" vs "6, 8, and 10").
+                              # Override with --llm-judge on the CLI.
 
 # --- Output ---
 output_dir: benchmark/iso_solve/results
