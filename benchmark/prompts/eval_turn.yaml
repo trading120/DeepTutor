@@ -9,13 +9,13 @@ system: |
   tailor the response to THIS student, or give generic explanations?
 
   ## Scoring strictness (CRITICAL)
-  Be STRICT and critical. Reserve 5 for truly exceptional responses that would stand out in a review.
-  - 5: Exceptional — clear, specific evidence; would be a model example.
-  - 4: Good — solid adaptation, but not exemplary.
-  - 3: Adequate — acceptable but unremarkable. Generic explanations score 3 at most on personalization.
-  - 2: Below average — weak adaptation or notable flaws.
-  - 1: Poor — little personalization, incorrect, or unresponsive.
-  When in doubt, score lower. Generic responses should NOT exceed 3 on personalization dimensions.
+  Be VERY STRICT. Most responses should score 2–3. Reserve 5 for rare, exemplary cases only.
+  - 5: Exceptional — would be published as a model example. Multiple specific, concrete adaptations visible.
+  - 4: Good — clear evidence of adaptation; NOT just "helpful" or "correct." Requires explicit references to student's profile/gaps.
+  - 3: Adequate — acceptable but unremarkable. Generic explanations, or weak adaptation, score 3 at most on personalization.
+  - 2: Below average — weak adaptation, notable flaws, or mostly generic content.
+  - 1: Poor — little personalization, incorrect, unresponsive, or ignores student context.
+  Rules: (1) When in doubt, score LOWER. (2) Generic responses MUST NOT exceed 3 on personalization. (3) For 4 or 5, you must cite specific evidence from the response. (4) Correct but generic explanations = 3 at most.
 
   ## Dimensions
 
@@ -33,7 +33,8 @@ system: |
 
   **Knowledge source alignment (25% of turn score, when source provided):**
   - knowledge_source_alignment (1-5): Does the tutor's explanation align with the knowledge base source?
-    No hallucination, no contradiction. Faithful to the textbook material. **When "Not applicable"**: Omit this key.
+    No hallucination, no contradiction. Faithful to the textbook material. Any unsupported claim or deviation = 3 at most.
+    **When "Not applicable"**: Omit this key.
 
   Output valid JSON only, no markdown or extra text:
   {
@@ -52,7 +53,7 @@ user_template: |
   ## Student Profile
   {profile_summary}
 
-  ## Knowledge Gaps (target concepts and misconceptions)
+  ## Knowledge Gaps (with source content — tutor should align explanations to this)
   {gaps_summary}
 
   ## Task
@@ -71,4 +72,6 @@ user_template: |
   {tutor_response}
 
   ## Your task
-  Score the tutor's response on all dimensions (1-5). Include knowledge_source_alignment when source content is provided. Be strict: only award 4 or 5 when there is clear, specific evidence. Output JSON only.
+  Score the tutor's response on all dimensions (1-5). Include knowledge_source_alignment when source content is provided.
+  Be VERY strict: 4 or 5 require explicit, cited evidence. Default to 3 when the response is merely adequate.
+  Output JSON only.

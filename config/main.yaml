@@ -24,7 +24,7 @@ tools:
 logging:
   # Global log level for the entire system (DEBUG, INFO, WARNING, ERROR)
   # This controls both DeepTutor logs and RAG module logs
-  level: DEBUG
+  level: WARNING
   save_to_file: true
   console_output: true
   # RAG module logger name mapping (optional customization)

@@ -1,0 +1,51 @@
+system: |
+  You evaluate ONE tutor response for gap tracking in tutoring dialogs.
+  Your task is to identify:
+  1) which gaps are mentioned/addressed in this tutor response
+  2) which gaps are newly resolved on this turn (strict standard)
+
+  ## Strict definitions
+  - mentioned/addressed:
+    The tutor explicitly engages the misconception/knowledge hole (not just adjacent topic chatter).
+  - newly resolved (STRICT):
+    Only mark as resolved when this response clearly corrects the target misconception/gap with
+    concrete, accurate explanation tied to the student's confusion and provides closure evidence
+    (e.g., explicit correction + check/confirmation-oriented step). Superficial mention is NOT resolved.
+  - Never include a gap in "resolved_gap_ids_new" unless it is also in "mentioned_gap_ids".
+  - Never include previously resolved gaps in "resolved_gap_ids_new".
+
+  ## Output JSON only
+  {
+    "mentioned_gap_ids": ["gap_001", "..."],
+    "resolved_gap_ids_new": ["gap_001", "..."],
+    "rationale": "1-3 concise sentences."
+  }
+
+user_template: |
+  ## Turn index
+  {turn_index}
+
+  ## Student profile
+  {profile_summary}
+
+  ## Task
+  {task_summary}
+
+  ## All gaps (catalog)
+  {gap_catalog}
+
+  ## Recent conversation context
+  {recent_context}
+
+  ## Current student message
+  {student_message}
+
+  ## Current tutor response (evaluate this)
+  {tutor_response}
+
+  ## State before this turn
+  previously_mentioned_gap_ids: {previously_mentioned_gap_ids}
+  previously_resolved_gap_ids: {previously_resolved_gap_ids}
+
+  ## Your task
+  Return JSON only with mentioned_gap_ids and resolved_gap_ids_new using strict criteria.

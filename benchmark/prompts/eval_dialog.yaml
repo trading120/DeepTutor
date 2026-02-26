@@ -8,13 +8,13 @@ system: |
   Focus on PERSONALIZATION: did the tutor consistently tailor the session to THIS student?
 
   ## Scoring strictness (CRITICAL)
-  Be STRICT and critical. Reserve 5 for truly exceptional dialogs.
-  - 5: Exceptional — consistent personalization; clear gap resolution; model session.
-  - 4: Good — solid overall, but not exemplary.
-  - 3: Adequate — acceptable but unremarkable. Mostly generic tutoring scores 3 at most.
-  - 2: Below average — weak adaptation or notable flaws.
+  Be VERY STRICT. Most dialogs should score 2–3. Reserve 5 for rare, exemplary sessions only.
+  - 5: Exceptional — would be published as a model session. Consistent, visible adaptation throughout; all gaps addressed with evidence.
+  - 4: Good — clear evidence of sustained adaptation; NOT just "helpful overall." Requires explicit references to profile/gaps across turns.
+  - 3: Adequate — acceptable but unremarkable. Mostly generic tutoring, or weak gap resolution, scores 3 at most on personalization.
+  - 2: Below average — weak adaptation, notable flaws, or gaps left unaddressed.
   - 1: Poor — little personalization, gaps ignored, or session failed.
-  When in doubt, score lower. Generic dialogs should NOT exceed 3 on personalization dimensions.
+  Rules: (1) When in doubt, score LOWER. (2) Generic dialogs MUST NOT exceed 3 on personalization. (3) For 4 or 5, cite specific evidence from the transcript. (4) "Generally helpful" without profile-specific adaptation = 3 at most.
 
   ## Dimensions
 
@@ -35,6 +35,7 @@ system: |
   **Knowledge source alignment (25% of dialog score, when source provided):**
   - knowledge_source_alignment (1-5): Across the entire dialog, did the tutor's explanations align
     with the knowledge base source? No hallucination, no contradiction. Faithful to the textbook.
+    Any unsupported claims or deviations = 3 at most.
     **When "Not applicable"**: Omit this key.
 
   Output valid JSON only, no markdown or extra text:
@@ -55,7 +56,7 @@ user_template: |
   ## Student Profile
   {profile_summary}
 
-  ## Knowledge Gaps (target concepts and misconceptions)
+  ## Knowledge Gaps (with source content — tutor should align explanations to this)
   {gaps_summary}
 
   ## Task
@@ -68,4 +69,6 @@ user_template: |
   {transcript}
 
   ## Your task
-  Score the ENTIRE dialog on all dimensions (1-5). Include knowledge_source_alignment when source content is provided. Be strict: only award 4 or 5 when there is clear, specific evidence. Output JSON only.
+  Score the ENTIRE dialog on all dimensions (1-5). Include knowledge_source_alignment when source content is provided.
+  Be VERY strict: 4 or 5 require explicit, cited evidence from the transcript. Default to 3 when the session is merely adequate.
+  Output JSON only.

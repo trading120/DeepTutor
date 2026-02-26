@@ -16,6 +16,7 @@ import logging
 from benchmark.data_generation.llm_utils import call_llm_json, load_prompt, render_prompt
 
 logger = logging.getLogger("benchmark.task_generator")
+MIN_GAPS_PER_TASK = 3
 
 
 def _normalize_task_id(task: dict, task_index: int) -> str:
@@ -28,6 +29,59 @@ def _normalize_task_id(task: dict, task_index: int) -> str:
     raw_id = str(task.get("task_id", "") or "")
     prefix = "task_reflect" if raw_id.startswith("task_reflect") else "task"
     return f"{prefix}_{task_index + 1:03d}"
+
+
+def _build_default_gap_pacing_plan(target_gaps: list[str]) -> list[dict]:
+    """
+    Build a deterministic staged gap exposure plan.
+
+    Rule of thumb:
+    - first gap: turns 1-2
+    - second gap: turns 3-4
+    - third gap: turns 5-6
+    """
+    plan = []
+    for idx, gid in enumerate(target_gaps):
+        start_turn = idx * 2 + 1
+        plan.append(
+            {
+                "gap_id": gid,
+                "turn_window": f"{start_turn}-{start_turn + 1}",
+                "trigger": "Reveal only when current confusion is partly addressed.",
+            }
+        )
+    return plan
+
+
+def _normalize_gap_pacing_plan(task: dict, target_gaps: list[str]) -> list[dict]:
+    """
+    Normalize LLM-provided gap_pacing_plan; fall back to default if malformed.
+    """
+    raw = task.get("gap_pacing_plan", [])
+    if not isinstance(raw, list):
+        return _build_default_gap_pacing_plan(target_gaps)
+
+    valid_set = set(target_gaps)
+    normalized = []
+    used = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        gid = item.get("gap_id")
+        if gid in valid_set and gid not in used:
+            normalized.append(
+                {
+                    "gap_id": gid,
+                    "turn_window": str(item.get("turn_window", "")) or "later",
+                    "trigger": str(item.get("trigger", "")) or "Reveal progressively.",
+                }
+            )
+            used.add(gid)
+
+    # Ensure all target gaps appear exactly once in plan
+    if len(normalized) != len(target_gaps):
+        return _build_default_gap_pacing_plan(target_gaps)
+    return normalized
 
 
 async def generate_tasks(
@@ -122,9 +176,17 @@ async def generate_single_task(
     """
     if not available_gaps:
         return None
+    if len(available_gaps) < MIN_GAPS_PER_TASK:
+        logger.warning(
+            "Insufficient available gaps for one task: need >= %d, got %d",
+            MIN_GAPS_PER_TASK,
+            len(available_gaps),
+        )
+        return None
 
     profile_id = student_profile.get("profile_id", "unknown")
-    gap_ids = {g.get("gap_id") for g in available_gaps}
+    ordered_gap_ids = [g.get("gap_id") for g in available_gaps if g.get("gap_id")]
+    gap_ids = set(ordered_gap_ids)
     logger.info(
         f"Generating task {task_index + 1} for profile '{profile_id}' "
         f"({len(available_gaps)} gaps available)"
@@ -155,11 +217,36 @@ async def generate_single_task(
     target = task.get("target_gaps", [])
     if isinstance(target, str):
         target = [target]
-    task["target_gaps"] = [gid for gid in target if gid in gap_ids]
 
-    if not task["target_gaps"]:
-        logger.warning(f"  Task {task['task_id']} has no valid target_gaps from available set")
+    # Keep only valid IDs, deduplicated, preserving order.
+    seen = set()
+    normalized = []
+    for gid in target:
+        if gid in gap_ids and gid not in seen:
+            normalized.append(gid)
+            seen.add(gid)
+
+    # Hard constraint: each task must include at least MIN_GAPS_PER_TASK non-overlapping gaps.
+    if len(normalized) < MIN_GAPS_PER_TASK:
+        for gid in ordered_gap_ids:
+            if gid not in seen:
+                normalized.append(gid)
+                seen.add(gid)
+            if len(normalized) >= MIN_GAPS_PER_TASK:
+                break
+
+    if len(normalized) < MIN_GAPS_PER_TASK:
+        logger.warning(
+            "  Task %s has only %d target gaps (<%d), dropping",
+            task["task_id"],
+            len(normalized),
+            MIN_GAPS_PER_TASK,
+        )
         return None
+
+    task["target_gaps"] = normalized
+    task["gap_pacing_plan"] = _normalize_gap_pacing_plan(task, normalized)
+    task["primary_gap"] = normalized[0]
 
     logger.info(f"  Task targets gaps: {task['target_gaps']}")
     return task
@@ -189,14 +276,14 @@ async def generate_tasks_with_partition(
     remaining = list(knowledge_gaps)
     task_index = task_index_offset
 
-    while remaining:
+    while len(remaining) >= MIN_GAPS_PER_TASK:
         task = await generate_single_task(
             knowledge_scope=knowledge_scope,
             student_profile=student_profile,
             available_gaps=remaining,
             task_index=task_index,
         )
-        if not task or not task.get("target_gaps"):
+        if not task or len(task.get("target_gaps", [])) < MIN_GAPS_PER_TASK:
             break
 
         tasks.append(task)
@@ -204,7 +291,15 @@ async def generate_tasks_with_partition(
         remaining = [g for g in remaining if g.get("gap_id") not in assigned_ids]
         task_index += 1
 
-    logger.info(f"  Partition complete: {len(tasks)} tasks, all gaps assigned")
+    if remaining:
+        logger.info(
+            "  Partition complete: %d tasks, %d leftover gaps dropped (<%d required per task)",
+            len(tasks),
+            len(remaining),
+            MIN_GAPS_PER_TASK,
+        )
+    else:
+        logger.info(f"  Partition complete: {len(tasks)} tasks, all gaps assigned")
     return tasks
 
 

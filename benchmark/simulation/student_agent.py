@@ -29,15 +29,12 @@ logger = logging.getLogger("benchmark.student_agent")
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
-# ReAct action markers: [ACTION: solve], [ACTION: generate_problem], [ACTION: task_complete]
-# Also support legacy [TASK_COMPLETE] as task_complete
-ACTION_RE = re.compile(
-    r"\[\s*ACTION\s*:\s*(solve|generate_problem|task_complete)\s*\]",
+# Only task_complete is used; no action required on other messages
+TASK_COMPLETE_RE = re.compile(r"\[\s*TASK_COMPLETE\s*\]", re.IGNORECASE)
+ACTION_TASK_COMPLETE_RE = re.compile(
+    r"\[\s*ACTION\s*:\s*task_complete\s*\]",
     re.IGNORECASE,
 )
-TASK_COMPLETE_RE = re.compile(r"\[\s*TASK_COMPLETE\s*\]", re.IGNORECASE)
-
-VALID_ACTIONS = frozenset({"solve", "generate_problem", "task_complete"})
 
 
 def _load_student_prompt_template() -> str:
@@ -94,6 +91,36 @@ def _build_beliefs_text(gaps: list[dict]) -> str:
             beliefs.append(f"About {concept}: {description}")
 
     return "\n\n".join(f"[Belief {i+1}]\n{b}" for i, b in enumerate(beliefs))
+
+
+def _build_gap_pacing_text(task: dict, gaps: list[dict]) -> str:
+    """
+    Build student-facing pacing constraints for gradual gap exposure.
+    """
+    plan = task.get("gap_pacing_plan", [])
+    if isinstance(plan, list) and plan:
+        lines = ["Reveal gaps progressively by the following plan:"]
+        for item in plan:
+            if not isinstance(item, dict):
+                continue
+            gid = item.get("gap_id", "?")
+            tw = item.get("turn_window", "later")
+            trig = item.get("trigger", "Reveal only when appropriate.")
+            lines.append(f"- {gid} around turns {tw}: {trig}")
+        lines.append(
+            "Never mention all gaps at once; focus on one current confusion per reply."
+        )
+        return "\n".join(lines)
+
+    # Fallback: derive order from provided gaps.
+    ids = [g.get("gap_id") for g in gaps if g.get("gap_id")]
+    if not ids:
+        return "Focus on one confusion at a time; do not list all issues in one message."
+    lines = ["Reveal gaps one-by-one in this order:"]
+    for i, gid in enumerate(ids, 1):
+        lines.append(f"- Step {i}: {gid}")
+    lines.append("Do not reveal next gap until after at least one tutor response.")
+    return "\n".join(lines)
 
 
 class StudentAgent:
@@ -165,6 +192,7 @@ class StudentAgent:
             partially_known=_format_list(knowledge_state.get("partially_known", [])),
             unknown=_format_list(knowledge_state.get("unknown", [])),
             beliefs=_build_beliefs_text(gaps),
+            gap_pacing_plan=_build_gap_pacing_text(task, gaps),
         )
 
         if prior_sessions_context:
@@ -242,16 +270,13 @@ class StudentAgent:
             max_tokens=self.max_tokens,
         )
 
-        # Parse action: [ACTION: solve|generate_problem|task_complete] or legacy [TASK_COMPLETE]
-        action = "solve"  # default
-        action_match = ACTION_RE.search(response)
-        if action_match:
-            action = action_match.group(1).lower()
-        elif TASK_COMPLETE_RE.search(response):
+        # Parse only task_complete; no action required on other messages
+        action = "solve"  # default (continue conversation)
+        if ACTION_TASK_COMPLETE_RE.search(response) or TASK_COMPLETE_RE.search(response):
             action = "task_complete"
 
-        # Strip all action markers from message
-        cleaned = ACTION_RE.sub("", response)
+        # Strip task_complete markers from message
+        cleaned = ACTION_TASK_COMPLETE_RE.sub("", response)
         cleaned = TASK_COMPLETE_RE.sub("", cleaned)
         cleaned = cleaned.strip()
 
@@ -273,10 +298,8 @@ class StudentAgent:
         for msg in self.history:
             role = "student" if msg["role"] == "assistant" else "tutor"
             entry = {"role": role, "content": msg["content"]}
-            if role == "student" and "action" in msg:
-                entry["action"] = msg["action"]
-            elif role == "student":
-                entry["action"] = "solve"  # default for initial message
+            if role == "student" and msg.get("action") == "task_complete":
+                entry["action"] = "task_complete"
             transcript.append(entry)
         return transcript
 

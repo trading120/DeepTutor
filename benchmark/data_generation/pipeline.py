@@ -43,6 +43,7 @@ from benchmark.data_generation.gap_generator import (
 from benchmark.data_generation.profile_generator import generate_profiles_for_kb
 from benchmark.data_generation.scope_generator import generate_knowledge_scope
 from benchmark.data_generation.task_generator import (
+    MIN_GAPS_PER_TASK,
     generate_tasks_with_partition,
     generate_tasks_with_partition_and_rejection,
 )
@@ -216,7 +217,16 @@ class DataGenerationPipeline:
         task_cfg = self.config.get("task_generation", {})
         logger.info(f"[Stage 4-5] Generating gaps and tasks for '{kb_name}' (min {task_cfg.get('min_tasks_per_profile', 3)} tasks/profile)...")
         min_tasks = task_cfg.get("min_tasks_per_profile", 3)
-        gaps_per_batch = task_cfg.get("gaps_per_batch", 3)
+        gaps_per_batch_cfg = task_cfg.get("gaps_per_batch", 3)
+        gaps_per_batch = max(gaps_per_batch_cfg, MIN_GAPS_PER_TASK)
+        if gaps_per_batch_cfg < MIN_GAPS_PER_TASK:
+            logger.warning(
+                "task_generation.gaps_per_batch=%d is too small; bumping to %d "
+                "to enforce >=%d gaps per task",
+                gaps_per_batch_cfg,
+                gaps_per_batch,
+                MIN_GAPS_PER_TASK,
+            )
         severity_weights = {}
         for level in gap_cfg.get("severity_levels", []):
             severity_weights[level["name"]] = level["weight"]

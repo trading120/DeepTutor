@@ -1,0 +1,41 @@
+system: |
+  You evaluate source faithfulness for ONE tutor response.
+  Compare the tutor response against source excerpts of the mentioned gaps.
+
+  Score on 1-5:
+  - 5: Fully faithful, no unsupported claims, no contradiction.
+  - 4: Mostly faithful, minor imprecision, no substantial contradiction.
+  - 3: Mixed; some unsupported or weakly grounded statements.
+  - 2: Major unsupported claims or clear drift from source.
+  - 1: Contradictory/hallucinated relative to source.
+
+  Be strict. If claims are not grounded in provided source, do not give 4 or 5.
+
+  Output JSON only:
+  {
+    "faithfulness_score": 1,
+    "rationale": "1-3 concise sentences.",
+    "unsupported_claims": ["optional short bullet", "..."]
+  }
+
+user_template: |
+  ## Turn index
+  {turn_index}
+
+  ## Recent conversation context
+  {recent_context}
+
+  ## Current student message
+  {student_message}
+
+  ## Current tutor response (evaluate this)
+  {tutor_response}
+
+  ## Mentioned gaps on this turn
+  {mentioned_gap_ids}
+
+  ## Source excerpts for mentioned gaps
+  {source_content_for_mentioned_gaps}
+
+  ## Your task
+  Score source faithfulness (1-5) for the current tutor response. Output JSON only.

@@ -4,7 +4,7 @@ Conversation Runner - Run multi-turn student-tutor conversations
 
 Supports two modes:
   1. Interactive: Human plays the tutor, types responses in terminal
-  2. Auto: Another LLM plays the tutor (simple mock for testing)
+  2. Auto: Tutor backend (deep_tutor or mock)
 
 Usage:
   # Interactive mode (editor by default; use --inline for console input):
@@ -13,11 +13,13 @@ Usage:
   # Console input (empty line + Enter to send; paste may truncate long content):
   python -m benchmark.simulation.conversation --entry path/to/entry.json --inline
 
-  # Auto mode (LLM plays the tutor; use --max-turns 5 if you hit timeout):
-  python -m benchmark.simulation.conversation --entry path/to/entry.json --auto
+  # Auto mode with DeepTutor backend:
+  python -m benchmark.simulation.conversation --entry path/to/entry.json --auto --auto-backend deep_tutor
 """
 
 import asyncio
+import contextlib
+import io
 import json
 import logging
 import os
@@ -26,13 +28,9 @@ import tempfile
 import textwrap
 from datetime import datetime
 from pathlib import Path
+from typing import Literal
 
 from benchmark.simulation.student_agent import StudentAgent
-
-try:
-    from src.services.llm.exceptions import LLMAPIError
-except ImportError:
-    LLMAPIError = Exception  # fallback if not in path
 
 # Delimiter to separate student context from tutor response in editor
 _EDITOR_DELIMITER = "\n\n--- Type your response below this line ---\n\n"
@@ -40,6 +38,35 @@ _EDITOR_DELIMITER = "\n\n--- Type your response below this line ---\n\n"
 logger = logging.getLogger("benchmark.conversation")
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+
+
+def _suppress_noisy_auto_logs() -> None:
+    """Suppress verbose INFO/DEBUG logs from RAG/LLM internals during simulation."""
+    # Clamp root logger first to suppress generic "INFO: Process ..." style logs.
+    logging.getLogger().setLevel(logging.WARNING)
+
+    noisy_loggers = [
+        "CodeExecutor",
+        "RAGService",
+        "RAGForward",
+        "Main",
+        "LLMClient",
+        "EmbeddingClient",
+        "lightrag",
+        "raganything",
+        "nano-vectordb",
+        "multiprocessing",
+        "openai",
+        "httpx",
+        "httpcore",
+        "src.services.embedding.provider",
+        "src.services.embedding.adapters.openai_compatible",
+        "src.services.rag",
+        "src.services.rag.service",
+        "src.tools.rag_tool",
+    ]
+    for name in noisy_loggers:
+        logging.getLogger(name).setLevel(logging.WARNING)
 
 
 def _get_tutor_input_via_editor(student_context: str) -> str | None:
@@ -89,14 +116,27 @@ def _get_tutor_input_via_editor(student_context: str) -> str | None:
             pass
 
 
+# Fixed prompt sent to tutor after student says task_complete
+TUTOR_POST_COMPLETE_PROMPT = (
+    "The student has indicated they are done with this session. "
+    "Based on this conversation, please create a practice problem that reinforces what was covered. "
+    "Give only the problem statement (no solution)."
+)
+
+
+def _build_sim_workspace(profile_id: str | None, entry_id: str, shared_by_profile: bool) -> str:
+    """Build workspace path for DeepTutor tool-based auto tutor."""
+    base = PROJECT_ROOT / "benchmark" / "data" / "sim_workspaces"
+    key = profile_id if (shared_by_profile and profile_id) else entry_id
+    return str(base / key)
+
+
 # Simple tutor system prompt for auto mode
 MOCK_TUTOR_SYSTEM = (
     "You are a helpful, patient, and knowledgeable tutor. "
     "A student is asking you for help. Respond clearly and helpfully. "
-    "The student may request different actions: "
-    "- solve: they want you to explain, solve, or walk through something — provide the explanation. "
-    "- generate_problem: they want a practice problem to try — give them a similar problem (with clear statement, no solution yet). "
-    "- task_complete: they are done — acknowledge and wish them well briefly. "
+    "If they ask for an explanation or walkthrough, provide it. "
+    "If they ask for a practice problem, give them a similar problem (clear statement, no solution yet). "
     "Ask follow-up questions to check understanding. "
     "If the student shows a misconception, gently guide them toward the correct understanding "
     "rather than just stating the answer. Use examples when helpful. "
@@ -107,7 +147,7 @@ MOCK_TUTOR_SYSTEM = (
 async def mock_tutor_respond(
     student_message: str,
     history: list[dict[str, str]],
-    student_action: str = "solve",
+    kb_name: str | None = None,
     prior_sessions_summary: str | None = None,
 ) -> str:
     """
@@ -117,13 +157,14 @@ async def mock_tutor_respond(
         student_message: The student's latest message
         history: Conversation history from tutor's perspective
             (role="user" for student, role="assistant" for tutor)
-        student_action: One of solve, generate_problem, task_complete
+        kb_name: Knowledge base name used for RAG retrieval
         prior_sessions_summary: Optional summary of previous sessions (tutor remembers)
 
     Returns:
         Tutor response string
     """
     from src.services.llm import factory
+    from src.tools.rag_tool import rag_search
 
     system = MOCK_TUTOR_SYSTEM
     if prior_sessions_summary:
@@ -136,9 +177,29 @@ async def mock_tutor_respond(
             + system
         )
 
-    # Prefix message with action hint for the tutor
-    action_hint = f"[Student requests: {student_action}]\n\n"
-    user_content = action_hint + student_message
+    # Auto mode RAG: use raw student message as query in naive mode.
+    rag_context = ""
+    if kb_name:
+        try:
+            # Some RAG internals print INFO lines directly to stdout/stderr.
+            # Silence those noisy streams during retrieval in auto mode.
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                rag_result = await rag_search(
+                    query=student_message,
+                    kb_name=kb_name,
+                    mode="naive",
+                )
+            rag_answer = (rag_result.get("answer") or rag_result.get("content") or "").strip()
+            if rag_answer:
+                rag_context = (
+                    "## Retrieved context (RAG, naive mode)\n"
+                    f"{rag_answer[:4000]}\n\n"
+                )
+        except Exception as e:
+            logger.warning("RAG retrieval failed for kb=%s: %s", kb_name, e)
+
+    # No action hint; tutor infers intent from message content.
+    user_content = f"{rag_context}## Student message\n{student_message}"
 
     # Build messages from tutor's perspective
     messages = [{"role": "system", "content": system}]
@@ -154,6 +215,73 @@ async def mock_tutor_respond(
     )
 
     return response
+
+
+async def deep_tutor_respond(
+    student_message: str,
+    kb_name: str,
+    workspace: str,
+    language: str = "en",
+) -> str:
+    """
+    Generate tutor response via DeepTutor solve pipeline.
+    Uses student's raw message as question.
+    """
+    from benchmark.simulation.tools import solve_question
+
+    if not kb_name:
+        return "(DeepTutor unavailable: missing kb_name in entry.)"
+
+    result = await solve_question(
+        workspace=workspace,
+        kb_name=kb_name,
+        question=student_message,
+        language=language,
+    )
+    answer = (result.get("answer") or "").strip()
+    return answer or "(No answer generated.)"
+
+
+def _format_question_block(q: dict) -> str:
+    """Format one generated question for tutor output."""
+    title = q.get("question", "").strip()
+    options = q.get("options", {}) or {}
+    lines = [title] if title else ["(Empty question)"]
+    if isinstance(options, dict):
+        for k, v in options.items():
+            lines.append(f"{k}. {v}")
+    elif isinstance(options, list):
+        for item in options:
+            lines.append(str(item))
+    return "\n".join(lines)
+
+
+async def deep_tutor_generate_practice_problem(
+    *,
+    kb_name: str,
+    workspace: str,
+    topic: str,
+    language: str = "en",
+) -> str:
+    """
+    Generate one practice problem via DeepTutor question pipeline.
+    """
+    from benchmark.simulation.tools import generate_questions
+
+    if not kb_name:
+        return "(Practice problem generation unavailable: missing kb_name in entry.)"
+
+    result = await generate_questions(
+        workspace=workspace,
+        kb_name=kb_name,
+        topic=topic,
+        num_questions=1,
+        language=language,
+    )
+    questions = result.get("questions", []) or []
+    if not questions:
+        return "(Practice problem generation failed.)"
+    return _format_question_block(questions[0])
 
 
 def _summarize_session(transcript: list[dict], task: dict, session_index: int) -> str:
@@ -175,6 +303,9 @@ async def _run_single_session(
     max_turns: int,
     auto: bool,
     use_editor: bool,
+    auto_backend: Literal["deep_tutor", "mock"] = "deep_tutor",
+    deeptutor_workspace: str | None = None,
+    deeptutor_language: str = "en",
     prior_sessions_summary: str | None = None,
 ) -> dict:
     """
@@ -185,25 +316,39 @@ async def _run_single_session(
         prior_sessions_context=prior_sessions_summary,
     )
     entry_id = entry.get("entry_id", "unknown")
+    kb_name = entry.get("kb_name")
+    profile_id = entry.get("profile", {}).get("profile_id")
+    workspace = deeptutor_workspace or _build_sim_workspace(
+        profile_id=profile_id,
+        entry_id=entry_id,
+        shared_by_profile=True,
+    )
+    task_title = entry.get("task", {}).get("title", "")
 
     tutor_history: list[dict[str, str]] = []
     student_msg = agent.initial_message()
-    student_action = "solve"
 
-    print(f"[Student] {student_msg}")
-    print(f"         [action: {student_action}]\n")
+    print(f"[Student] {student_msg}\n")
 
     for turn in range(1, max_turns):
         if auto:
             try:
-                tutor_msg = await mock_tutor_respond(
-                    student_msg,
-                    tutor_history,
-                    student_action,
-                    prior_sessions_summary=prior_sessions_summary,
-                )
-            except (LLMAPIError, asyncio.TimeoutError, TimeoutError) as e:
-                logger.error("Mock tutor LLM failed: %s", e)
+                if auto_backend == "deep_tutor":
+                    tutor_msg = await deep_tutor_respond(
+                        student_message=student_msg,
+                        kb_name=kb_name,
+                        workspace=workspace,
+                        language=deeptutor_language,
+                    )
+                else:
+                    tutor_msg = await mock_tutor_respond(
+                        student_msg,
+                        tutor_history,
+                        kb_name=kb_name,
+                        prior_sessions_summary=prior_sessions_summary,
+                    )
+            except Exception as e:
+                logger.error("Auto tutor failed (%s): %s", auto_backend, e)
                 print(f"\n[Tutor] Error: {e}")
                 break
         else:
@@ -237,10 +382,51 @@ async def _run_single_session(
         print(f"[Tutor] {tutor_msg}\n")
 
         student_msg, student_action = await agent.respond(tutor_msg)
-        print(f"[Student] {student_msg}")
-        print(f"         [action: {student_action}]\n")
+        print(f"[Student] {student_msg}\n")
         if student_action == "task_complete":
-            print("[System] Student indicated task complete.")
+            print("[System] Student indicated task complete. Requesting practice problem from tutor...")
+            tutor_history.append({"role": "user", "content": student_msg})
+            if auto:
+                try:
+                    if auto_backend == "deep_tutor":
+                        topic = (
+                            f"{task_title}\n"
+                            f"Conversation summary request: {TUTOR_POST_COMPLETE_PROMPT}\n"
+                            "Generate one practice problem aligned to this session."
+                        )
+                        practice_msg = await deep_tutor_generate_practice_problem(
+                            kb_name=kb_name,
+                            workspace=workspace,
+                            topic=topic,
+                            language=deeptutor_language,
+                        )
+                    else:
+                        practice_msg = await mock_tutor_respond(
+                            TUTOR_POST_COMPLETE_PROMPT,
+                            tutor_history,
+                            kb_name=kb_name,
+                            prior_sessions_summary=prior_sessions_summary,
+                        )
+                except Exception as e:
+                    logger.error("Auto tutor post-complete failed (%s): %s", auto_backend, e)
+                    practice_msg = "(Practice problem generation failed.)"
+            else:
+                print(f"[Tutor] {TUTOR_POST_COMPLETE_PROMPT}")
+                print("[Tutor] (type practice problem, empty line + Enter to send)")
+                lines = []
+                while True:
+                    try:
+                        line = input()
+                    except EOFError:
+                        break
+                    if line == "" and lines:
+                        break
+                    lines.append(line)
+                practice_msg = "\n".join(lines) if lines else "(No practice problem provided.)"
+            tutor_history.append({"role": "assistant", "content": practice_msg})
+            print(f"[Tutor] {practice_msg}\n")
+            # Append to agent history so it appears in transcript
+            agent.history.append({"role": "user", "content": practice_msg})
             break
 
     transcript = agent.get_transcript()
@@ -256,6 +442,8 @@ async def run_conversation(
     entry_path: str | Path,
     max_turns: int = 20,
     auto: bool = False,
+    auto_backend: Literal["deep_tutor", "mock"] = "deep_tutor",
+    deeptutor_language: str = "en",
     output_dir: str | Path | None = None,
     entry_index: int = 0,
     use_editor: bool = True,
@@ -292,31 +480,46 @@ async def run_conversation(
 
     agent = StudentAgent.from_entry(entry)
     entry_id = entry.get("entry_id", entry_path.stem)
+    kb_name = entry.get("kb_name")
+    profile_id = entry.get("profile", {}).get("profile_id")
+    workspace = _build_sim_workspace(
+        profile_id=profile_id,
+        entry_id=entry_id,
+        shared_by_profile=False,
+    )
+    task_title = entry.get("task", {}).get("title", "")
 
     print(f"\n{'='*60}")
     print(f"Conversation: {entry_id}")
-    print(f"Mode: {'auto (LLM tutor)' if auto else 'interactive (you are the tutor)'}")
+    mode_desc = f"auto ({auto_backend})" if auto else "interactive (you are the tutor)"
+    print(f"Mode: {mode_desc}")
     print(f"Max turns: {max_turns}")
     print(f"{'='*60}\n")
 
     # Tutor-side history (from tutor's perspective)
     tutor_history: list[dict[str, str]] = []
 
-    # Turn 0: Student's initial message (implicit action: solve)
+    # Turn 0: Student's initial message
     student_msg = agent.initial_message()
-    student_action = "solve"
-    print(f"[Student] {student_msg}")
-    print(f"         [action: {student_action}]\n")
+    print(f"[Student] {student_msg}\n")
 
     for turn in range(1, max_turns):
         # Get tutor response
         if auto:
             try:
-                tutor_msg = await mock_tutor_respond(
-                    student_msg, tutor_history, student_action
-                )
-            except (LLMAPIError, asyncio.TimeoutError, TimeoutError) as e:
-                logger.error("Mock tutor LLM failed (timeout or API error): %s", e)
+                if auto_backend == "deep_tutor":
+                    tutor_msg = await deep_tutor_respond(
+                        student_message=student_msg,
+                        kb_name=kb_name,
+                        workspace=workspace,
+                        language=deeptutor_language,
+                    )
+                else:
+                    tutor_msg = await mock_tutor_respond(
+                        student_msg, tutor_history, kb_name=kb_name
+                    )
+            except Exception as e:
+                logger.error("Auto tutor failed (%s): %s", auto_backend, e)
                 print(f"\n[Tutor] Error: {e}")
                 print("(Conversation stopped. Partial transcript will be saved.)")
                 break
@@ -349,18 +552,56 @@ async def run_conversation(
                     break
                 tutor_msg = "\n".join(lines)
 
-        # Record in tutor history (store raw student message, no action prefix)
+        # Record in tutor history
         tutor_history.append({"role": "user", "content": student_msg})
         tutor_history.append({"role": "assistant", "content": tutor_msg})
 
         print(f"[Tutor] {tutor_msg}\n")
 
-        # Get student response (ReAct: message + action)
+        # Get student response (task_complete only when ending)
         student_msg, student_action = await agent.respond(tutor_msg)
-        print(f"[Student] {student_msg}")
-        print(f"         [action: {student_action}]\n")
+        print(f"[Student] {student_msg}\n")
         if student_action == "task_complete":
-            print("[System] Student indicated task complete. Ending conversation.")
+            print("[System] Student indicated task complete. Requesting practice problem from tutor...")
+            tutor_history.append({"role": "user", "content": student_msg})
+            if auto:
+                try:
+                    if auto_backend == "deep_tutor":
+                        topic = (
+                            f"{task_title}\n"
+                            f"Conversation summary request: {TUTOR_POST_COMPLETE_PROMPT}\n"
+                            "Generate one practice problem aligned to this session."
+                        )
+                        practice_msg = await deep_tutor_generate_practice_problem(
+                            kb_name=kb_name,
+                            workspace=workspace,
+                            topic=topic,
+                            language=deeptutor_language,
+                        )
+                    else:
+                        practice_msg = await mock_tutor_respond(
+                            TUTOR_POST_COMPLETE_PROMPT,
+                            tutor_history,
+                            kb_name=kb_name,
+                        )
+                except Exception as e:
+                    logger.error("Auto tutor post-complete failed (%s): %s", auto_backend, e)
+                    practice_msg = "(Practice problem generation failed.)"
+            else:
+                print(f"[Tutor] {TUTOR_POST_COMPLETE_PROMPT}")
+                print("[Tutor] (type practice problem, empty line + Enter to send)")
+                lines = []
+                while True:
+                    try:
+                        line = input()
+                    except EOFError:
+                        break
+                    if line == "" and lines:
+                        break
+                    lines.append(line)
+                practice_msg = "\n".join(lines) if lines else "(No practice problem provided.)"
+            print(f"[Tutor] {practice_msg}\n")
+            agent.history.append({"role": "user", "content": practice_msg})
             break
 
     print(f"{'='*60}")
@@ -430,6 +671,8 @@ async def run_multi_session(
     entry_paths: list[str] | None = None,
     max_turns: int = 20,
     auto: bool = False,
+    auto_backend: Literal["deep_tutor", "mock"] = "deep_tutor",
+    deeptutor_language: str = "en",
     output_dir: str | Path | None = None,
     use_editor: bool = True,
     evolve_profile: bool = True,
@@ -465,9 +708,16 @@ async def run_multi_session(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     profile_id_display = profile_id or entries[0].get("profile", {}).get("profile_id", "?")
+    shared_workspace = _build_sim_workspace(
+        profile_id=profile_id_display,
+        entry_id=entries[0].get("entry_id", "unknown"),
+        shared_by_profile=True,
+    )
     print(f"\n{'='*60}")
     print(f"Multi-session: {profile_id_display} ({len(entries)} sessions)")
-    print(f"Mode: {'auto (LLM tutor)' if auto else 'interactive'}")
+    print(f"Mode: {'auto (' + auto_backend + ')' if auto else 'interactive'}")
+    if auto and auto_backend == "deep_tutor":
+        print(f"DeepTutor workspace(shared): {shared_workspace}")
     print(f"Evolve profile: {evolve_profile}")
     print(f"{'='*60}\n")
 
@@ -498,6 +748,9 @@ async def run_multi_session(
             max_turns=max_turns,
             auto=auto,
             use_editor=use_editor,
+            auto_backend=auto_backend,
+            deeptutor_workspace=shared_workspace,
+            deeptutor_language=deeptutor_language,
             prior_sessions_summary=prior_ctx,
         )
 
@@ -579,7 +832,18 @@ async def main():
     parser.add_argument(
         "--auto",
         action="store_true",
-        help="Use LLM mock tutor instead of interactive mode",
+        help="Use auto tutor backend instead of interactive mode",
+    )
+    parser.add_argument(
+        "--auto-backend",
+        choices=["deep_tutor", "mock"],
+        default="deep_tutor",
+        help="Auto tutor backend (default: deep_tutor)",
+    )
+    parser.add_argument(
+        "--deeptutor-language",
+        default="en",
+        help="Language for DeepTutor tools (default: en)",
     )
     parser.add_argument(
         "--max-turns",
@@ -605,6 +869,8 @@ async def main():
     )
 
     args = parser.parse_args()
+    if args.auto:
+        _suppress_noisy_auto_logs()
 
     if args.multi_session:
         if args.entries:
@@ -613,6 +879,8 @@ async def main():
                 entry_paths=entry_paths,
                 max_turns=args.max_turns,
                 auto=args.auto,
+                auto_backend=args.auto_backend,
+                deeptutor_language=args.deeptutor_language,
                 output_dir=args.output_dir,
                 use_editor=not args.inline,
                 evolve_profile=not args.no_evolve,
@@ -623,6 +891,8 @@ async def main():
                 profile_id=args.profile,
                 max_turns=args.max_turns,
                 auto=args.auto,
+                auto_backend=args.auto_backend,
+                deeptutor_language=args.deeptutor_language,
                 output_dir=args.output_dir,
                 use_editor=not args.inline,
                 evolve_profile=not args.no_evolve,
@@ -638,6 +908,8 @@ async def main():
             entry_path=args.entry,
             max_turns=args.max_turns,
             auto=args.auto,
+            auto_backend=args.auto_backend,
+            deeptutor_language=args.deeptutor_language,
             output_dir=args.output_dir,
             entry_index=args.entry_index,
             use_editor=not args.inline,

@@ -1,24 +1,11 @@
 #!/usr/bin/env python
 """
-CLI for running benchmark evaluation on transcript files.
+CLI for benchmark evaluation.
 
-Supports single-session and multi-session transcripts (from run_multi_session).
-
-Usage:
-  # Evaluate a single transcript (turn-level + dialog-level):
-  python -m benchmark.evaluation.run --transcript benchmark/data/transcripts/xxx.json
-
-  # Evaluate multi-session transcript (each session scored, then averaged):
-  python -m benchmark.evaluation.run --transcript multi_calc1_beginner_00_xxx.json
-
-  # Dialog-only (faster, skip per-turn scoring):
-  python -m benchmark.evaluation.run --transcript xxx.json --dialog-only
-
-  # Evaluate all transcripts in a directory:
-  python -m benchmark.evaluation.run --transcript-dir benchmark/data/transcripts
-
-  # Output to file:
-  python -m benchmark.evaluation.run --transcript xxx.json --output results.json
+Current evaluator uses 3 independent metrics:
+1) gap_tracking (LLM, per turn)
+2) source_faithfulness (LLM, per turn, 1-5)
+3) turn_count (non-LLM)
 """
 
 import argparse
@@ -68,7 +55,7 @@ async def main() -> None:
     parser.add_argument(
         "--dialog-only",
         action="store_true",
-        help="Skip turn-level evaluation (faster, dialog-level only)",
+        help="Skip per-turn LLM metrics (gap_tracking/source_faithfulness), keep turn_count only",
     )
     parser.add_argument(
         "--output",
@@ -139,23 +126,40 @@ async def main() -> None:
             elif "sessions" in result:
                 print(f"Profile: {result.get('profile_id', '?')} ({result.get('num_sessions', 0)} sessions)")
                 for i, s in enumerate(result.get("sessions", []), 1):
-                    print(f"  Session {i} ({s.get('entry_id', '?')}): turns={s.get('actual_turns', 0)}, "
-                          f"combined={s.get('combined_overall_score', 0):.2f}")
-                print(f"Turns: {result.get('actual_turns', 0)}")
-                print(f"Combined overall (avg): {result.get('combined_overall_score', 0):.2f}")
-                print(f"Combined personalization (avg): {result.get('combined_personalization_score', 0):.2f}")
+                    metrics = s.get("metrics", {})
+                    gap = metrics.get("gap_tracking", {})
+                    faith = metrics.get("source_faithfulness", {})
+                    turns = metrics.get("turn_count", {})
+                    print(
+                        f"  Session {i} ({s.get('entry_id', '?')}): "
+                        f"paired_turns={turns.get('paired_turns', 0)}, "
+                        f"resolved={gap.get('resolved_gaps_final_count', 0)}/{gap.get('total_gaps', 0)}, "
+                        f"faith_avg={faith.get('avg_score', 'N/A')}"
+                    )
+                agg = result.get("aggregate", {})
+                agg_turn = agg.get("turn_count", {})
+                agg_faith = agg.get("source_faithfulness", {})
+                print(f"Total paired turns: {agg_turn.get('paired_turns_total', 0)}")
+                print(f"Faithfulness overall avg: {agg_faith.get('avg_score_overall', 'N/A')}")
             else:
                 print(f"Entry: {result.get('entry_id', '?')}")
-                print(f"Turns: {result.get('actual_turns', 0)}")
-                print(f"Dialog overall: {result.get('overall_dialog_score', 0):.2f}")
-                print(f"Dialog personalization: {result.get('personalization_dialog_score', 0):.2f}")
-                if result.get("turn_scores"):
-                    print(f"Turn avg overall: {result.get('turn_avg_overall', 0):.2f}")
-                    print(f"Turn avg personalization: {result.get('turn_avg_personalization', 0):.2f}")
-                print(f"Combined overall (turn 40% + dialog 60%): {result.get('combined_overall_score', 0):.2f}")
-                print(f"Combined personalization: {result.get('combined_personalization_score', 0):.2f}")
-                if result.get("summary"):
-                    print(f"Summary: {result['summary'][:200]}...")
+                metrics = result.get("metrics", {})
+                gap = metrics.get("gap_tracking", {})
+                faith = metrics.get("source_faithfulness", {})
+                turns = metrics.get("turn_count", {})
+                print(f"Paired turns: {turns.get('paired_turns', 0)}")
+                print(
+                    "Gap resolution: "
+                    f"{gap.get('resolved_gaps_final_count', 0)}/{gap.get('total_gaps', 0)} "
+                    f"(mentioned={len(gap.get('mentioned_gap_ids_final', []))})"
+                )
+                print(
+                    "Source faithfulness (1-5): "
+                    f"avg={faith.get('avg_score', 'N/A')}, "
+                    f"min={faith.get('min_score', 'N/A')}, "
+                    f"max={faith.get('max_score', 'N/A')}, "
+                    f"scored_turns={faith.get('num_scored_turns', 0)}"
+                )
         except Exception as e:
             logger.exception("Failed to evaluate %s", path)
             results.append({"transcript_path": str(path), "error": str(e)})

@@ -1,14 +1,16 @@
 #!/usr/bin/env python
 """
-Benchmark Evaluator - Score tutor responses and full dialogs
+Benchmark Evaluator - Independent metric evaluation (no weighted merge)
 
-Uses LLM-as-judge to evaluate:
-- Turn-level: 4 dimensions (50% personalization, 25% effectiveness, 25% knowledge_source_alignment)
-- Dialog-level: 5 dimensions (50% personalization, 25% quality, 25% knowledge_source_alignment)
+Metrics:
+1) Gap tracking (LLM, per tutor turn): mentioned vs newly resolved gaps (strict criteria)
+2) Source faithfulness (LLM, per tutor turn): 1-5 score against source text
+   - Evaluated only for gaps mentioned in metric 1 on that turn
+3) Turn count (non-LLM): student/tutor interaction counts
 
 Supports:
-- Single-session: JSON with 'transcript' and 'entry' keys
-- Multi-session: JSON with 'sessions' array; each session has transcript, entry, entry_id
+- Single-session transcript: {"transcript": [...], "entry": {...}}
+- Multi-session transcript: {"sessions": [{"transcript": [...], "entry": {...}, ...}, ...]}
 """
 
 import json
@@ -20,18 +22,7 @@ from benchmark.data_generation.llm_utils import call_llm_json, load_prompt
 logger = logging.getLogger("benchmark.evaluation")
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-
-# Turn: 50% personalization, 25% effectiveness, 25% knowledge_source_alignment (when source present)
-TURN_PERSONALIZATION_KEYS = ["profile_adaptation", "misconception_targeting"]
-TURN_EFFECTIVENESS_KEYS = ["response_quality", "engagement"]
-TURN_SOURCE_ALIGNMENT_KEY = "knowledge_source_alignment"
-TURN_WEIGHTS = (0.5, 0.25, 0.25)  # personalization, effectiveness, source_alignment
-
-# Dialog: 50% personalization, 25% quality, 25% knowledge_source_alignment (when source present)
-DIALOG_PERSONALIZATION_KEYS = ["adaptation_consistency", "gap_resolution", "success_criteria_met"]
-DIALOG_QUALITY_KEYS = ["session_quality", "student_agency"]
-DIALOG_SOURCE_ALIGNMENT_KEY = "knowledge_source_alignment"
-DIALOG_WEIGHTS = (0.5, 0.25, 0.25)  # personalization, quality, source_alignment
+RECENT_CONTEXT_WINDOW = 8  # messages (student+tutor) to provide around each turn
 
 
 def _format_profile(profile: dict) -> str:
@@ -55,34 +46,6 @@ def _format_profile(profile: dict) -> str:
     return "\n".join(parts) if parts else "(no profile)"
 
 
-def _format_gaps(gaps: list) -> str:
-    """Format knowledge gaps for prompt."""
-    if not gaps:
-        return "(no gaps)"
-    lines = []
-    for g in gaps:
-        lines.append(
-            f"- {g.get('target_concept', '?')}: {g.get('description', '')[:200]}... "
-            f"Manifests as: {g.get('manifestation', '')[:150]}"
-        )
-    return "\n".join(lines)
-
-
-def _format_source_content(source_content: dict[int, str] | None, gap_source_pages: list[int] | None = None) -> str:
-    """Format source content for evaluator. If gap_source_pages given, only include those pages."""
-    if not source_content:
-        return "Not applicable"
-    pages = sorted(source_content.keys())
-    if gap_source_pages:
-        pages = [p for p in pages if p in gap_source_pages]
-    lines = []
-    for p in pages:
-        text = source_content.get(p, "")
-        if text:
-            lines.append(f"### Page {p}\n{text[:2000]}{'...' if len(text) > 2000 else ''}")
-    return "\n\n".join(lines) if lines else "Not applicable"
-
-
 def _format_task(task: dict) -> str:
     """Format task for prompt."""
     parts = []
@@ -94,9 +57,19 @@ def _format_task(task: dict) -> str:
         parts.append(f"Success criteria: {task['success_criteria']}")
     if task.get("target_gaps"):
         parts.append(f"Target gaps: {task['target_gaps']}")
-    if task.get("expected_gap_exposure"):
-        parts.append(f"Expected gap exposure: {task['expected_gap_exposure'][:300]}...")
     return "\n".join(parts) if parts else "(no task)"
+
+
+def _normalize_source_by_page(source_content: dict | None) -> dict[int, str]:
+    """Normalize source_content keys to int (JSON may have str page keys)."""
+    if not source_content:
+        return {}
+    out = {}
+    for k, v in source_content.items():
+        pk = int(k) if isinstance(k, str) and k.isdigit() else k
+        if isinstance(pk, int):
+            out[pk] = v or ""
+    return out
 
 
 def _format_transcript(transcript: list[dict]) -> str:
@@ -104,73 +77,151 @@ def _format_transcript(transcript: list[dict]) -> str:
     lines = []
     for i, msg in enumerate(transcript, 1):
         role = msg.get("role", "?")
-        content = (msg.get("content", "") or "")[:800]
-        if len((msg.get("content") or "")) > 800:
+        content = (msg.get("content", "") or "")[:900]
+        if len((msg.get("content") or "")) > 900:
             content += "..."
         lines.append(f"[{i}] {role.upper()}: {content}")
-    return "\n\n".join(lines)
+    return "\n\n".join(lines) if lines else "(empty)"
 
 
-def _compute_weighted_avg_three(
-    scores: dict,
-    keys_a: list,
-    keys_b: list,
-    key_c: str | None,
-    weights: tuple[float, float, float],
-) -> float:
-    """Compute weighted average: w_a * avg_a + w_b * avg_b + w_c * score_c (when key_c present)."""
-    w_a, w_b, w_c = weights
-    vals_a = [scores.get(k) for k in keys_a if scores.get(k) is not None]
-    vals_b = [scores.get(k) for k in keys_b if scores.get(k) is not None]
-    val_c = scores.get(key_c) if key_c else None
-
-    avg_a = sum(vals_a) / len(vals_a) if vals_a else 0.0
-    avg_b = sum(vals_b) / len(vals_b) if vals_b else 0.0
-
-    if val_c is not None and key_c:
-        return w_a * avg_a + w_b * avg_b + w_c * val_c
-    total = w_a + w_b
-    if total <= 0:
-        return avg_a if vals_a else (avg_b if vals_b else 0.0)
-    return (w_a / total) * avg_a + (w_b / total) * avg_b
+def _filter_dialog_messages(transcript: list[dict]) -> list[dict]:
+    """Keep only student/tutor messages for evaluation scope."""
+    return [m for m in transcript if m.get("role") in {"student", "tutor"}]
 
 
-async def evaluate_turn(
+def _extract_turn_pairs(dialog_msgs: list[dict]) -> list[dict]:
+    """
+    Build per-turn student->tutor pairs.
+
+    Returns list of:
+      {
+        "turn_index": int,
+        "student_message": str,
+        "tutor_response": str,
+        "student_msg_index": int,   # index in dialog_msgs
+      }
+    """
+    turns: list[dict] = []
+    turn_index = 0
+    for i in range(len(dialog_msgs) - 1):
+        a, b = dialog_msgs[i], dialog_msgs[i + 1]
+        if a.get("role") == "student" and b.get("role") == "tutor":
+            turn_index += 1
+            turns.append(
+                {
+                    "turn_index": turn_index,
+                    "student_message": a.get("content", ""),
+                    "tutor_response": b.get("content", ""),
+                    "student_msg_index": i,
+                }
+            )
+    return turns
+
+
+def _get_recent_context(dialog_msgs: list[dict], student_msg_index: int, window: int = RECENT_CONTEXT_WINDOW) -> str:
+    """
+    Return recent context ending at current student message.
+
+    This intentionally provides more than just current turn for metric-1 robustness.
+    """
+    start = max(0, student_msg_index - window + 1)
+    snippet = dialog_msgs[start : student_msg_index + 1]
+    return _format_transcript(snippet)
+
+
+def _build_gap_map(gaps: list[dict]) -> dict[str, dict]:
+    """Build gap_id -> gap dict mapping."""
+    out = {}
+    for g in gaps:
+        gid = str(g.get("gap_id", "")).strip()
+        if gid:
+            out[gid] = g
+    return out
+
+
+def _format_gap_catalog(gaps: list[dict]) -> str:
+    """Format full gap catalog for metric-1 prompt."""
+    if not gaps:
+        return "(no gaps)"
+    lines = []
+    for g in gaps:
+        gid = g.get("gap_id", "unknown")
+        concept = g.get("target_concept", "?")
+        desc = (g.get("description", "") or "")[:350]
+        mani = (g.get("manifestation", "") or "")[:240]
+        corr = (g.get("correct_understanding", "") or "")[:320]
+        lines.append(
+            f"- gap_id: {gid}\n"
+            f"  concept: {concept}\n"
+            f"  description: {desc}\n"
+            f"  manifestation: {mani}\n"
+            f"  expected_correct_understanding: {corr}"
+        )
+    return "\n".join(lines)
+
+
+def _format_mentioned_gaps_with_source(mentioned_gap_ids: list[str], gap_by_id: dict[str, dict], source_content: dict | None) -> str:
+    """Format only mentioned gaps and their source excerpts for metric-2."""
+    if not mentioned_gap_ids:
+        return "(no mentioned gaps)"
+
+    src_by_page = _normalize_source_by_page(source_content)
+    lines = []
+    for gid in mentioned_gap_ids:
+        gap = gap_by_id.get(gid)
+        if not gap:
+            continue
+        concept = gap.get("target_concept", "?")
+        desc = (gap.get("description", "") or "")[:260]
+        lines.append(f"### {gid} - {concept}")
+        lines.append(f"Description: {desc}")
+        pages = sorted(set(gap.get("source_pages", [])))
+        if pages:
+            lines.append(f"Source pages: {pages}")
+        for p in pages:
+            text = src_by_page.get(p, "")
+            if text:
+                excerpt = text[:1800] + ("..." if len(text) > 1800 else "")
+                lines.append(f"Source page {p}:\n{excerpt}")
+        lines.append("")
+    return "\n".join(lines).strip() or "(no source excerpt for mentioned gaps)"
+
+
+async def evaluate_gap_tracking_turn(
+    *,
     entry: dict,
-    transcript_up_to_turn: list[dict],
+    turn_index: int,
     student_message: str,
     tutor_response: str,
-    turn_index: int,
-    temperature: float = 0.2,
+    recent_context: str,
+    previously_mentioned_gap_ids: list[str],
+    previously_resolved_gap_ids: list[str],
+    temperature: float,
 ) -> dict:
     """
-    Evaluate a single tutor response.
+    Metric-1 (LLM): detect mentioned gaps and newly resolved gaps on this tutor turn.
 
-    Returns:
-        dict with scores, rationale, personalization_subscore, overall_turn_score
+    Strict resolution is enforced in prompt:
+      - "resolved" requires clear correction + concrete closure evidence, not a casual mention.
     """
-    prompt_cfg = load_prompt("eval_turn")
+    prompt_cfg = load_prompt("eval_gap_tracking_turn")
     profile = entry.get("profile", {})
     gaps = entry.get("gaps", [])
     task = entry.get("task", {})
-    source_content = entry.get("source_content")
-
-    gap_source_pages = []
-    if source_content and gaps:
-        for g in gaps:
-            gap_source_pages.extend(g.get("source_pages", []))
-    source_summary = _format_source_content(source_content, gap_source_pages or None)
-
-    conv_text = _format_transcript(transcript_up_to_turn)
+    gap_by_id = _build_gap_map(gaps)
+    valid_gap_ids = set(gap_by_id.keys())
+    unresolved = valid_gap_ids - set(previously_resolved_gap_ids)
 
     user_prompt = prompt_cfg["user_template"].format(
         profile_summary=_format_profile(profile),
-        gaps_summary=_format_gaps(gaps),
         task_summary=_format_task(task),
-        source_content_summary=source_summary,
-        conversation_context=conv_text or "(start of conversation)",
+        gap_catalog=_format_gap_catalog(gaps),
+        recent_context=recent_context,
         student_message=student_message,
         tutor_response=tutor_response,
+        turn_index=turn_index,
+        previously_mentioned_gap_ids=sorted(set(previously_mentioned_gap_ids)),
+        previously_resolved_gap_ids=sorted(set(previously_resolved_gap_ids)),
     )
 
     try:
@@ -181,71 +232,70 @@ async def evaluate_turn(
             max_tokens=1024,
         )
     except (json.JSONDecodeError, Exception) as e:
-        logger.warning("Turn %d evaluation failed: %s", turn_index, e)
+        logger.warning("Gap tracking failed at turn %d: %s", turn_index, e)
         return {
             "turn_index": turn_index,
-            "scores": {},
+            "mentioned_gap_ids": [],
+            "resolved_gap_ids_new": [],
             "rationale": f"Evaluation failed: {e}",
-            "personalization_subscore": 0.0,
-            "overall_turn_score": 0.0,
             "error": str(e),
         }
 
-    scores = result.get("scores", {})
-    rationale = result.get("rationale", "")
+    mentioned = [gid for gid in result.get("mentioned_gap_ids", []) if gid in valid_gap_ids]
+    mentioned = sorted(set(mentioned))
 
-    personalization_subscore = 0.0
-    if TURN_PERSONALIZATION_KEYS:
-        p_vals = [scores.get(k) for k in TURN_PERSONALIZATION_KEYS if scores.get(k) is not None]
-        personalization_subscore = sum(p_vals) / len(p_vals) if p_vals else 0.0
-
-    source_key = TURN_SOURCE_ALIGNMENT_KEY if (source_content and scores.get(TURN_SOURCE_ALIGNMENT_KEY) is not None) else None
-    overall = _compute_weighted_avg_three(
-        scores,
-        TURN_PERSONALIZATION_KEYS,
-        TURN_EFFECTIVENESS_KEYS,
-        source_key,
-        TURN_WEIGHTS,
-    )
+    resolved_new_raw = [gid for gid in result.get("resolved_gap_ids_new", []) if gid in unresolved]
+    resolved_new = sorted(set(resolved_new_raw))
+    # Resolved should be a subset of mentioned on this turn for consistency.
+    resolved_new = [gid for gid in resolved_new if gid in mentioned]
 
     return {
         "turn_index": turn_index,
-        "scores": scores,
-        "rationale": rationale,
-        "personalization_subscore": round(personalization_subscore, 2),
-        "overall_turn_score": round(overall, 2),
+        "mentioned_gap_ids": mentioned,
+        "resolved_gap_ids_new": resolved_new,
+        "rationale": result.get("rationale", ""),
     }
 
 
-async def evaluate_dialog(
-    entry: dict,
-    transcript: list[dict],
-    temperature: float = 0.2,
+async def evaluate_source_faithfulness_turn(
+    *,
+    turn_index: int,
+    student_message: str,
+    tutor_response: str,
+    recent_context: str,
+    mentioned_gap_ids: list[str],
+    gap_by_id: dict[str, dict],
+    source_content: dict | None,
+    temperature: float,
 ) -> dict:
     """
-    Evaluate the entire tutoring dialog.
-
-    Returns:
-        dict with scores, summary, personalization_dialog_score, overall_dialog_score
+    Metric-2 (LLM): faithfulness (1-5) against source text of mentioned gaps only.
     """
-    prompt_cfg = load_prompt("eval_dialog")
-    profile = entry.get("profile", {})
-    gaps = entry.get("gaps", [])
-    task = entry.get("task", {})
-    source_content = entry.get("source_content")
+    if not mentioned_gap_ids:
+        return {
+            "turn_index": turn_index,
+            "mentioned_gap_ids": [],
+            "not_applicable": True,
+            "reason": "No mentioned gaps on this turn.",
+        }
 
-    gap_source_pages = []
-    if source_content and gaps:
-        for g in gaps:
-            gap_source_pages.extend(g.get("source_pages", []))
-    source_summary = _format_source_content(source_content, gap_source_pages or None)
+    prompt_cfg = load_prompt("eval_source_faithfulness_turn")
+    source_for_mentioned = _format_mentioned_gaps_with_source(mentioned_gap_ids, gap_by_id, source_content)
+    if source_for_mentioned.startswith("(no source excerpt"):
+        return {
+            "turn_index": turn_index,
+            "mentioned_gap_ids": mentioned_gap_ids,
+            "not_applicable": True,
+            "reason": "Mentioned gaps have no usable source excerpts.",
+        }
 
     user_prompt = prompt_cfg["user_template"].format(
-        profile_summary=_format_profile(profile),
-        gaps_summary=_format_gaps(gaps),
-        task_summary=_format_task(task),
-        source_content_summary=source_summary,
-        transcript=_format_transcript(transcript),
+        turn_index=turn_index,
+        recent_context=recent_context,
+        student_message=student_message,
+        tutor_response=tutor_response,
+        mentioned_gap_ids=mentioned_gap_ids,
+        source_content_for_mentioned_gaps=source_for_mentioned,
     )
 
     try:
@@ -253,47 +303,66 @@ async def evaluate_dialog(
             user_prompt=user_prompt,
             system_prompt=prompt_cfg["system"],
             temperature=temperature,
-            max_tokens=1024,
+            max_tokens=900,
         )
     except (json.JSONDecodeError, Exception) as e:
-        logger.warning("Dialog evaluation failed: %s", e)
+        logger.warning("Source faithfulness failed at turn %d: %s", turn_index, e)
         return {
-            "scores": {},
-            "summary": f"Evaluation failed: {e}",
-            "personalization_dialog_score": 0.0,
-            "overall_dialog_score": 0.0,
+            "turn_index": turn_index,
+            "mentioned_gap_ids": mentioned_gap_ids,
+            "not_applicable": True,
+            "reason": f"Evaluation failed: {e}",
             "error": str(e),
         }
 
-    scores = result.get("scores", {})
-    summary = result.get("summary", "")
-
-    personalization_subscore = 0.0
-    if DIALOG_PERSONALIZATION_KEYS:
-        p_vals = [scores.get(k) for k in DIALOG_PERSONALIZATION_KEYS if scores.get(k) is not None]
-        personalization_subscore = sum(p_vals) / len(p_vals) if p_vals else 0.0
-
-    source_key = DIALOG_SOURCE_ALIGNMENT_KEY if (source_content and scores.get(DIALOG_SOURCE_ALIGNMENT_KEY) is not None) else None
-    overall = _compute_weighted_avg_three(
-        scores,
-        DIALOG_PERSONALIZATION_KEYS,
-        DIALOG_QUALITY_KEYS,
-        source_key,
-        DIALOG_WEIGHTS,
-    )
+    score = result.get("faithfulness_score")
+    try:
+        score = int(score)
+    except (TypeError, ValueError):
+        score = None
+    if score is not None:
+        score = max(1, min(5, score))
 
     return {
-        "scores": scores,
-        "summary": summary,
-        "personalization_dialog_score": round(personalization_subscore, 2),
-        "overall_dialog_score": round(overall, 2),
+        "turn_index": turn_index,
+        "mentioned_gap_ids": mentioned_gap_ids,
+        "faithfulness_score": score,
+        "rationale": result.get("rationale", ""),
+        "unsupported_claims": result.get("unsupported_claims", []),
+        "not_applicable": score is None,
+    }
+
+
+def _build_source_faithfulness_summary(per_turn: list[dict]) -> dict:
+    """Aggregate metric-2 stats: min/max/avg over scored turns only."""
+    scored = [t["faithfulness_score"] for t in per_turn if not t.get("not_applicable") and t.get("faithfulness_score") is not None]
+    if not scored:
+        return {
+            "scale": "1-5",
+            "num_scored_turns": 0,
+            "max_score": None,
+            "min_score": None,
+            "avg_score": None,
+            "per_turn": per_turn,
+        }
+    return {
+        "scale": "1-5",
+        "num_scored_turns": len(scored),
+        "max_score": max(scored),
+        "min_score": min(scored),
+        "avg_score": round(sum(scored) / len(scored), 2),
+        "per_turn": per_turn,
     }
 
 
 def _load_entry_by_id(entry_id: str) -> dict | None:
-    """Try to load entry from benchmark JSONL by entry_id (for backward compat)."""
+    """
+    Try to load entry by entry_id from generated JSONL files.
+    Supports nested benchmark_<timestamp>/_all_entries.jsonl layout.
+    """
     generated_dir = PROJECT_ROOT / "benchmark" / "data" / "generated"
-    for jsonl_path in sorted(generated_dir.glob("*.jsonl")):
+    candidates = sorted(generated_dir.glob("**/*.jsonl"))
+    for jsonl_path in candidates:
         with open(jsonl_path, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
@@ -306,85 +375,156 @@ def _load_entry_by_id(entry_id: str) -> dict | None:
 
 
 async def _evaluate_single_session(
+    *,
     transcript: list[dict],
     entry: dict,
     entry_id: str,
     skip_turns: bool,
     temperature: float,
 ) -> dict:
-    """Evaluate one session (single dialog). Returns result dict."""
-    result = {
-        "entry_id": entry_id,
-        "actual_turns": len([m for m in transcript if m.get("role") == "student"]),
-        "turn_scores": [],
-        "dialog_scores": {},
-        "personalization_dialog_score": 0.0,
-        "overall_dialog_score": 0.0,
-        "summary": "",
+    """Evaluate one session with 3 independent metrics."""
+    dialog_msgs = _filter_dialog_messages(transcript)
+    turns = _extract_turn_pairs(dialog_msgs)
+    gaps = entry.get("gaps", [])
+    gap_by_id = _build_gap_map(gaps)
+    source_content = entry.get("source_content")
+
+    logger.info(
+        "Metrics enabled: gap_tracking(LLM), source_faithfulness(LLM)%s, turn_count(non-LLM)",
+        " [source present]" if source_content else " [source missing: may be N/A]",
+    )
+
+    student_turns = sum(1 for m in dialog_msgs if m.get("role") == "student")
+    tutor_turns = sum(1 for m in dialog_msgs if m.get("role") == "tutor")
+    turn_count_metric = {
+        "student_turns": student_turns,
+        "tutor_turns": tutor_turns,
+        "paired_turns": len(turns),
     }
 
+    gap_tracking_per_turn: list[dict] = []
+    source_faithfulness_per_turn: list[dict] = []
+    mentioned_so_far: set[str] = set()
+    resolved_so_far: set[str] = set()
+
     if not skip_turns:
-        turn_idx = 0
-        for i in range(len(transcript)):
-            msg = transcript[i]
-            if msg.get("role") == "student" and i + 1 < len(transcript):
-                next_msg = transcript[i + 1]
-                if next_msg.get("role") == "tutor":
-                    student_msg = msg.get("content", "")
-                    tutor_msg = next_msg.get("content", "")
-                    turn_idx += 1
-                    conv_before = transcript[:i]
-                    turn_result = await evaluate_turn(
-                        entry=entry,
-                        transcript_up_to_turn=conv_before,
-                        student_message=student_msg,
-                        tutor_response=tutor_msg,
-                        turn_index=turn_idx,
-                        temperature=temperature,
-                    )
-                    result["turn_scores"].append(turn_result)
-                    logger.info(
-                        "Turn %d: overall=%.2f, personalization=%.2f",
-                        turn_idx,
-                        turn_result["overall_turn_score"],
-                        turn_result["personalization_subscore"],
-                    )
+        for t in turns:
+            turn_index = t["turn_index"]
+            student_message = t["student_message"]
+            tutor_response = t["tutor_response"]
+            recent_context = _get_recent_context(dialog_msgs, t["student_msg_index"])
 
-    dialog_result = await evaluate_dialog(
-        entry=entry,
-        transcript=transcript,
-        temperature=temperature,
-    )
-    result["dialog_scores"] = dialog_result.get("scores", {})
-    result["personalization_dialog_score"] = dialog_result.get("personalization_dialog_score", 0.0)
-    result["overall_dialog_score"] = dialog_result.get("overall_dialog_score", 0.0)
-    result["summary"] = dialog_result.get("summary", "")
+            # Metric 1: gap mention + strict resolution
+            gap_turn = await evaluate_gap_tracking_turn(
+                entry=entry,
+                turn_index=turn_index,
+                student_message=student_message,
+                tutor_response=tutor_response,
+                recent_context=recent_context,
+                previously_mentioned_gap_ids=sorted(mentioned_so_far),
+                previously_resolved_gap_ids=sorted(resolved_so_far),
+                temperature=temperature,
+            )
+            mentioned_turn = set(gap_turn.get("mentioned_gap_ids", []))
+            resolved_turn_new = set(gap_turn.get("resolved_gap_ids_new", []))
 
-    turn_avg_overall = 0.0
-    turn_avg_personalization = 0.0
-    if result["turn_scores"]:
-        turn_avg_overall = sum(t["overall_turn_score"] for t in result["turn_scores"]) / len(
-            result["turn_scores"]
-        )
-        turn_avg_personalization = sum(
-            t["personalization_subscore"] for t in result["turn_scores"]
-        ) / len(result["turn_scores"])
+            mentioned_so_far |= mentioned_turn
+            resolved_so_far |= resolved_turn_new
 
-    result["turn_avg_overall"] = round(turn_avg_overall, 2)
-    result["turn_avg_personalization"] = round(turn_avg_personalization, 2)
+            gap_turn["resolved_gap_ids_total"] = sorted(resolved_so_far)
+            gap_turn["mentioned_count_turn"] = len(mentioned_turn)
+            gap_turn["resolved_count_turn_new"] = len(resolved_turn_new)
+            gap_turn["resolved_count_total"] = len(resolved_so_far)
+            gap_tracking_per_turn.append(gap_turn)
 
-    if result["turn_scores"]:
-        result["combined_overall_score"] = round(
-            0.4 * turn_avg_overall + 0.6 * result["overall_dialog_score"], 2
-        )
-        result["combined_personalization_score"] = round(
-            0.4 * turn_avg_personalization + 0.6 * result["personalization_dialog_score"], 2
-        )
-    else:
-        result["combined_overall_score"] = result["overall_dialog_score"]
-        result["combined_personalization_score"] = result["personalization_dialog_score"]
+            # Metric 2: source faithfulness using only mentioned gaps this turn
+            faith_turn = await evaluate_source_faithfulness_turn(
+                turn_index=turn_index,
+                student_message=student_message,
+                tutor_response=tutor_response,
+                recent_context=recent_context,
+                mentioned_gap_ids=sorted(mentioned_turn),
+                gap_by_id=gap_by_id,
+                source_content=source_content,
+                temperature=temperature,
+            )
+            source_faithfulness_per_turn.append(faith_turn)
 
-    return result
+            logger.info(
+                "Turn %d: mentioned=%d, newly_resolved=%d, resolved_total=%d, faithfulness=%s",
+                turn_index,
+                len(mentioned_turn),
+                len(resolved_turn_new),
+                len(resolved_so_far),
+                faith_turn.get("faithfulness_score", "N/A"),
+            )
+
+    gap_tracking_metric = {
+        "total_gaps": len(gap_by_id),
+        "mentioned_gap_ids_final": sorted(mentioned_so_far),
+        "resolved_gap_ids_final": sorted(resolved_so_far),
+        "resolved_gaps_final_count": len(resolved_so_far),
+        "per_turn": gap_tracking_per_turn,
+    }
+    source_faithfulness_metric = _build_source_faithfulness_summary(source_faithfulness_per_turn)
+
+    return {
+        "entry_id": entry_id,
+        "actual_turns": len(turns),
+        "metrics": {
+            "gap_tracking": gap_tracking_metric,
+            "source_faithfulness": source_faithfulness_metric,
+            "turn_count": turn_count_metric,
+        },
+    }
+
+
+def _aggregate_multi_session(session_results: list[dict]) -> dict:
+    """Build lightweight aggregate view; each session gap stats stay independent."""
+    if not session_results:
+        return {}
+
+    total_student_turns = 0
+    total_tutor_turns = 0
+    total_paired_turns = 0
+    faith_scores = []
+    resolved_counts = []
+    total_gaps_counts = []
+
+    for s in session_results:
+        tc = s.get("metrics", {}).get("turn_count", {})
+        total_student_turns += tc.get("student_turns", 0)
+        total_tutor_turns += tc.get("tutor_turns", 0)
+        total_paired_turns += tc.get("paired_turns", 0)
+
+        gt = s.get("metrics", {}).get("gap_tracking", {})
+        resolved_counts.append(gt.get("resolved_gaps_final_count", 0))
+        total_gaps_counts.append(gt.get("total_gaps", 0))
+
+        sf = s.get("metrics", {}).get("source_faithfulness", {})
+        for t in sf.get("per_turn", []):
+            score = t.get("faithfulness_score")
+            if score is not None and not t.get("not_applicable"):
+                faith_scores.append(score)
+
+    return {
+        "turn_count": {
+            "student_turns_total": total_student_turns,
+            "tutor_turns_total": total_tutor_turns,
+            "paired_turns_total": total_paired_turns,
+        },
+        "gap_tracking": {
+            "resolved_gaps_per_session": resolved_counts,
+            "total_gaps_per_session": total_gaps_counts,
+        },
+        "source_faithfulness": {
+            "scale": "1-5",
+            "num_scored_turns_total": len(faith_scores),
+            "max_score_overall": max(faith_scores) if faith_scores else None,
+            "min_score_overall": min(faith_scores) if faith_scores else None,
+            "avg_score_overall": round(sum(faith_scores) / len(faith_scores), 2) if faith_scores else None,
+        },
+    }
 
 
 async def evaluate_transcript(
@@ -393,18 +533,12 @@ async def evaluate_transcript(
     temperature: float = 0.2,
 ) -> dict:
     """
-    Evaluate a transcript file (from conversation runner output).
-
-    Supports single-session (transcript + entry) and multi-session (sessions array).
-    For multi-session, evaluates each session and returns aggregated scores.
+    Evaluate transcript using independent metrics (no weighted merge).
 
     Args:
         transcript_path: Path to transcript JSON
-        skip_turns: If True, only run dialog-level evaluation (faster)
-        temperature: LLM temperature for evaluation
-
-    Returns:
-        Full evaluation result
+        skip_turns: If True, skip LLM per-turn metrics and keep only turn_count
+        temperature: LLM temperature for metric-1 and metric-2
     """
     path = Path(transcript_path)
     if not path.exists():
@@ -449,32 +583,17 @@ async def evaluate_transcript(
                 "re-run multi-session to save entries)"
             )
 
-        # Aggregate
-        n = len(session_results)
         return {
             "profile_id": profile_id,
             "transcript_path": str(path),
-            "num_sessions": n,
+            "num_sessions": len(session_results),
             "sessions": session_results,
-            "actual_turns": sum(r["actual_turns"] for r in session_results),
-            "combined_overall_score": round(
-                sum(r["combined_overall_score"] for r in session_results) / n, 2
-            ),
-            "combined_personalization_score": round(
-                sum(r["combined_personalization_score"] for r in session_results) / n, 2
-            ),
-            "overall_dialog_score": round(
-                sum(r["overall_dialog_score"] for r in session_results) / n, 2
-            ),
-            "personalization_dialog_score": round(
-                sum(r["personalization_dialog_score"] for r in session_results) / n, 2
-            ),
+            "aggregate": _aggregate_multi_session(session_results),
         }
 
     # Single-session format
     transcript = data.get("transcript", [])
     entry = data.get("entry", {})
-
     if not entry:
         raise ValueError("Transcript must contain 'entry' (benchmark entry with profile, gaps, task)")
 
