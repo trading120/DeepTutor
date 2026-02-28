@@ -150,13 +150,25 @@ async def init_knowledge_base(args):
         print("Use --docs or --docs-dir to specify documents\n")
         return
 
+    # Resolve KB name:
+    # - Use explicit name if provided
+    # - Otherwise default to first document filename (without extension)
+    kb_name = args.name
+    if not kb_name:
+        if not doc_files:
+            print("✗ Error: Cannot infer KB name without documents")
+            print("Please provide kb name explicitly or pass --docs/--docs-dir\n")
+            return
+        kb_name = Path(doc_files[0]).stem
+        print(f"ℹ️  KB name not provided, defaulting to filename: {kb_name}")
+
     # Initialize knowledge base
     print("\n" + "=" * 60)
-    print(f"🚀 Initializing knowledge base: {args.name}")
+    print(f"🚀 Initializing knowledge base: {kb_name}")
     print("=" * 60 + "\n")
 
     initializer = KnowledgeBaseInitializer(
-        kb_name=args.name, base_dir=str(KNOWLEDGE_BASES_DIR), api_key=api_key, base_url=base_url
+        kb_name=kb_name, base_dir=str(KNOWLEDGE_BASES_DIR), api_key=api_key, base_url=base_url
     )
 
     # Create directory structure
@@ -191,7 +203,7 @@ async def init_knowledge_base(args):
         print("⏭️  Skipping numbered items extraction\n")
 
     print("\n" + "=" * 60)
-    print(f"✓ Knowledge base '{args.name}' initialization complete!")
+    print(f"✓ Knowledge base '{kb_name}' initialization complete!")
     print(f"Location: {initializer.kb_dir}")
     print("=" * 60 + "\n")
 
@@ -438,7 +450,7 @@ Usage Examples:
 
     # init command
     init_parser = subparsers.add_parser("init", help="Initialize new knowledge base")
-    init_parser.add_argument("name", help="Knowledge base name")
+    init_parser.add_argument("name", nargs="?", help="Knowledge base name (optional)")
     init_parser.add_argument("--docs", nargs="+", help="Document file list")
     init_parser.add_argument("--docs-dir", help="Document directory")
     init_parser.add_argument("--api-key", help="OpenAI API Key")
