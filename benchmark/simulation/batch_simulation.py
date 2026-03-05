@@ -85,6 +85,8 @@ async def _generate_entries_for_profile(
 
     min_tasks = task_cfg.get("min_tasks_per_profile", 3)
     gaps_per_batch = max(task_cfg.get("gaps_per_batch", 3), MIN_GAPS_PER_TASK)
+    llm_retry_attempts = max(1, int(task_cfg.get("llm_retry_attempts", 3)))
+    llm_retry_delay_sec = max(0.0, float(task_cfg.get("llm_retry_delay_sec", 1.5)))
 
     use_content_list = gap_cfg.get("use_content_list", False)
     page_content: dict[int, str] | None = None
@@ -109,40 +111,73 @@ async def _generate_entries_for_profile(
     task_index_offset = 0
     max_batches = 10
 
+    async def _run_with_retry(op_name: str, batch_num: int, coro_factory):
+        last_error: Exception | None = None
+        for attempt in range(1, llm_retry_attempts + 1):
+            try:
+                return await coro_factory()
+            except Exception as e:
+                last_error = e
+                if attempt >= llm_retry_attempts:
+                    raise
+                wait_sec = llm_retry_delay_sec * attempt
+                logger.warning(
+                    "  %s batch %d %s failed (%d/%d): %s; retrying in %.1fs",
+                    profile_id,
+                    batch_num,
+                    op_name,
+                    attempt,
+                    llm_retry_attempts,
+                    e,
+                    wait_sec,
+                )
+                if wait_sec > 0:
+                    await asyncio.sleep(wait_sec)
+        if last_error is not None:
+            raise last_error
+
     for batch_num in range(1, max_batches + 1):
         if len(all_tasks) >= min_tasks:
             break
 
         try:
             if page_content:
-                new_gaps = await generate_gaps_from_pages(
-                    page_content=page_content,
-                    student_profile=profile,
-                    num_gaps=gaps_per_batch,
-                    severity_weights=severity_weights or None,
-                    gap_id_offset=len(all_gaps),
-                )
+                async def _gen_gaps():
+                    return await generate_gaps_from_pages(
+                        page_content=page_content,
+                        student_profile=profile,
+                        num_gaps=gaps_per_batch,
+                        severity_weights=severity_weights or None,
+                        gap_id_offset=len(all_gaps),
+                    )
             else:
-                new_gaps = await generate_gaps(
-                    knowledge_scope=knowledge_scope,
-                    student_profile=profile,
-                    num_gaps=gaps_per_batch,
-                    severity_weights=severity_weights or None,
-                    gap_id_offset=len(all_gaps),
-                )
+                async def _gen_gaps():
+                    return await generate_gaps(
+                        knowledge_scope=knowledge_scope,
+                        student_profile=profile,
+                        num_gaps=gaps_per_batch,
+                        severity_weights=severity_weights or None,
+                        gap_id_offset=len(all_gaps),
+                    )
+
+            new_gaps = await _run_with_retry("gap_generation", batch_num, _gen_gaps)
 
             if not new_gaps:
                 logger.warning("  No new gaps for %s, stopping", profile_id)
                 break
 
-            all_gaps.extend(new_gaps)
+            async def _gen_tasks():
+                return await generate_tasks_with_partition(
+                    knowledge_scope=knowledge_scope,
+                    student_profile=profile,
+                    knowledge_gaps=new_gaps,
+                    task_index_offset=task_index_offset,
+                )
 
-            tasks = await generate_tasks_with_partition(
-                knowledge_scope=knowledge_scope,
-                student_profile=profile,
-                knowledge_gaps=new_gaps,
-                task_index_offset=task_index_offset,
-            )
+            tasks = await _run_with_retry("task_generation", batch_num, _gen_tasks)
+
+            # Only commit this batch's gaps/tasks after both generation steps succeed.
+            all_gaps.extend(new_gaps)
             all_tasks.extend(tasks)
             task_index_offset += len(tasks)
 
@@ -155,7 +190,7 @@ async def _generate_entries_for_profile(
             )
         except Exception as e:
             logger.error("  Entry generation failed for %s batch %d: %s", profile_id, batch_num, e)
-            break
+            continue
 
     gap_by_id = {g["gap_id"]: g for g in all_gaps if "gap_id" in g}
     entries: list[dict] = []
