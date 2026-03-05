@@ -109,6 +109,101 @@ async def _generate_entries_for_one_profile(
         return result
 
 
+async def _process_one_kb(
+    *,
+    kb_name: str,
+    kb_base_dir: Path,
+    entries_root: Path,
+    profile_cfg: dict,
+    rag_cfg: dict,
+    cfg: dict,
+    profile_semaphore: asyncio.Semaphore,
+    kb_semaphore: asyncio.Semaphore,
+) -> tuple[dict, int]:
+    """Process one KB: scope -> profiles -> entries (profiles in parallel)."""
+    async with kb_semaphore:
+        kb_dir = kb_base_dir / kb_name
+        kb_entry_root = entries_root / kb_name
+        kb_entry_root.mkdir(parents=True, exist_ok=True)
+
+        kb_record = {
+            "kb_name": kb_name,
+            "status": "ok",
+            "error": None,
+            "num_profiles": 0,
+            "profiles": [],
+        }
+        profile_errors = 0
+
+        if not kb_dir.exists():
+            kb_record["status"] = "error"
+            kb_record["error"] = f"KB directory not found: {kb_dir}"
+            logger.error("[%s] KB directory not found", kb_name)
+            return kb_record, profile_errors
+
+        try:
+            scope = await generate_knowledge_scope(
+                kb_name=kb_name,
+                seed_queries=rag_cfg.get("seed_queries"),
+                mode=rag_cfg.get("mode", "naive"),
+                kb_base_dir=str(kb_base_dir),
+            )
+            with open(kb_entry_root / "knowledge_scope.json", "w", encoding="utf-8") as f:
+                json.dump(scope, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            kb_record["status"] = "error"
+            kb_record["error"] = f"knowledge_scope generation failed: {e}"
+            logger.error("[%s] knowledge_scope failed: %s", kb_name, e)
+            return kb_record, profile_errors
+
+        try:
+            profiles = await generate_profiles_for_kb(
+                knowledge_scope=scope,
+                background_types=profile_cfg.get(
+                    "background_types", ["beginner", "intermediate", "advanced"]
+                ),
+                profiles_per_kb=profile_cfg.get("profiles_per_subtopic", 3),
+            )
+            with open(kb_entry_root / "profiles.json", "w", encoding="utf-8") as f:
+                json.dump(profiles, f, ensure_ascii=False, indent=2)
+            kb_record["num_profiles"] = len(profiles)
+        except Exception as e:
+            kb_record["status"] = "error"
+            kb_record["error"] = f"profile generation failed: {e}"
+            logger.error("[%s] profile generation failed: %s", kb_name, e)
+            return kb_record, profile_errors
+
+        tasks = [
+            _generate_entries_for_one_profile(
+                kb_name=kb_name,
+                profile=p,
+                scope=scope,
+                cfg=cfg,
+                kb_base_dir=str(kb_base_dir),
+                kb_entries_dir=kb_entry_root,
+                semaphore=profile_semaphore,
+            )
+            for p in profiles
+        ]
+        profile_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for r in profile_results:
+            if isinstance(r, Exception):
+                profile_errors += 1
+                kb_record["profiles"].append(
+                    {
+                        "status": "error",
+                        "error": str(r),
+                    }
+                )
+                continue
+            kb_record["profiles"].append(r)
+            if r.get("status") != "ok":
+                profile_errors += 1
+
+        return kb_record, profile_errors
+
+
 async def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -172,98 +267,58 @@ async def main() -> None:
     profile_cfg = cfg.get("profile_generation", {})
     rag_cfg = cfg.get("rag_query", {})
 
-    print(f"KBs: {len(kb_names)} | Concurrency(profile): {args.concurrency}")
+    kb_parallel = max(1, min(args.concurrency, 4))
+    print(
+        f"KBs: {len(kb_names)} | Concurrency(profile): {args.concurrency} | "
+        f"Concurrency(kb): {kb_parallel}"
+    )
     print(f"Output root: {output_root}")
     for kb in kb_names:
         print(f"  - {kb}")
 
+    profile_sem = asyncio.Semaphore(args.concurrency)
+    # Keep KB-level parallelism moderate to avoid overloading RAG/LLM services.
+    kb_sem = asyncio.Semaphore(kb_parallel)
+    logger.info(
+        "Step1 parallelism: kb_concurrency=%d, profile_concurrency=%d",
+        kb_parallel,
+        args.concurrency,
+    )
+
+    kb_tasks = [
+        _process_one_kb(
+            kb_name=kb_name,
+            kb_base_dir=kb_base_dir,
+            entries_root=entries_root,
+            profile_cfg=profile_cfg,
+            rag_cfg=rag_cfg,
+            cfg=cfg,
+            profile_semaphore=profile_sem,
+            kb_semaphore=kb_sem,
+        )
+        for kb_name in kb_names
+    ]
+    raw_results = await asyncio.gather(*kb_tasks, return_exceptions=True)
+
     kb_records: list[dict] = []
     total_profile_errors = 0
-    sem = asyncio.Semaphore(args.concurrency)
-
-    for kb_name in kb_names:
-        kb_dir = kb_base_dir / kb_name
-        kb_entry_root = entries_root / kb_name
-        kb_entry_root.mkdir(parents=True, exist_ok=True)
-
-        kb_record = {
-            "kb_name": kb_name,
-            "status": "ok",
-            "error": None,
-            "num_profiles": 0,
-            "profiles": [],
-        }
-
-        if not kb_dir.exists():
-            kb_record["status"] = "error"
-            kb_record["error"] = f"KB directory not found: {kb_dir}"
-            kb_records.append(kb_record)
-            logger.error("[%s] KB directory not found", kb_name)
-            continue
-
-        try:
-            scope = await generate_knowledge_scope(
-                kb_name=kb_name,
-                seed_queries=rag_cfg.get("seed_queries"),
-                mode=rag_cfg.get("mode", "naive"),
-                kb_base_dir=str(kb_base_dir),
+    for i, item in enumerate(raw_results):
+        if isinstance(item, Exception):
+            kb_name = kb_names[i]
+            kb_records.append(
+                {
+                    "kb_name": kb_name,
+                    "status": "error",
+                    "error": str(item),
+                    "num_profiles": 0,
+                    "profiles": [],
+                }
             )
-            with open(kb_entry_root / "knowledge_scope.json", "w", encoding="utf-8") as f:
-                json.dump(scope, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            kb_record["status"] = "error"
-            kb_record["error"] = f"knowledge_scope generation failed: {e}"
-            kb_records.append(kb_record)
-            logger.error("[%s] knowledge_scope failed: %s", kb_name, e)
+            logger.error("[%s] unexpected failure: %s", kb_name, item)
             continue
-
-        try:
-            profiles = await generate_profiles_for_kb(
-                knowledge_scope=scope,
-                background_types=profile_cfg.get(
-                    "background_types", ["beginner", "intermediate", "advanced"]
-                ),
-                profiles_per_kb=profile_cfg.get("profiles_per_subtopic", 3),
-            )
-            with open(kb_entry_root / "profiles.json", "w", encoding="utf-8") as f:
-                json.dump(profiles, f, ensure_ascii=False, indent=2)
-            kb_record["num_profiles"] = len(profiles)
-        except Exception as e:
-            kb_record["status"] = "error"
-            kb_record["error"] = f"profile generation failed: {e}"
-            kb_records.append(kb_record)
-            logger.error("[%s] profile generation failed: %s", kb_name, e)
-            continue
-
-        tasks = [
-            _generate_entries_for_one_profile(
-                kb_name=kb_name,
-                profile=p,
-                scope=scope,
-                cfg=cfg,
-                kb_base_dir=str(kb_base_dir),
-                kb_entries_dir=kb_entry_root,
-                semaphore=sem,
-            )
-            for p in profiles
-        ]
-        profile_results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        for r in profile_results:
-            if isinstance(r, Exception):
-                total_profile_errors += 1
-                kb_record["profiles"].append(
-                    {
-                        "status": "error",
-                        "error": str(r),
-                    }
-                )
-                continue
-            kb_record["profiles"].append(r)
-            if r.get("status") != "ok":
-                total_profile_errors += 1
-
+        kb_record, profile_errors = item
         kb_records.append(kb_record)
+        total_profile_errors += profile_errors
 
     manifest = {
         "step": "step1_generate_entries",
