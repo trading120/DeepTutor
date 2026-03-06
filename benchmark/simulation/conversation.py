@@ -219,6 +219,18 @@ async def mock_tutor_respond(
     return response
 
 
+_TUTOR_INSTRUCTION_PREFIX = (
+    "You are tutoring a student one-on-one. Respond as a tutor, NOT as an essay writer.\n"
+    "Guidelines:\n"
+    "- First, diagnose what specific concept or step the student is confused about.\n"
+    "- Explain the 'why' behind the concept using concrete examples from the source material.\n"
+    "- If a misconception is present, address it directly and explain the correct understanding.\n"
+    "- End with a short guiding question to check the student's understanding.\n"
+    "- Keep the response focused and conversational (NOT a long structured essay).\n\n"
+    "Student says: "
+)
+
+
 async def deep_tutor_respond(
     student_message: str,
     kb_name: str,
@@ -227,17 +239,20 @@ async def deep_tutor_respond(
 ) -> str:
     """
     Generate tutor response via DeepTutor solve pipeline.
-    Uses student's raw message as question.
+    Wraps the student message with tutoring instructions so the
+    WriterAgent produces a pedagogical response rather than an essay.
     """
     from benchmark.simulation.tools import solve_question
 
     if not kb_name:
         return "(DeepTutor unavailable: missing kb_name in entry.)"
 
+    question = _TUTOR_INSTRUCTION_PREFIX + student_message
+
     result = await solve_question(
         workspace=workspace,
         kb_name=kb_name,
-        question=student_message,
+        question=question,
         language=language,
         enabled_tools=["rag_search", "code_execute", "reason"],
     )

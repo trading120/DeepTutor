@@ -4,16 +4,42 @@ system: |
   Score two independent dimensions on 1-5:
 
   1) Insightfulness:
-  - Does the response help the student think, not just receive an answer?
-  - Good signals: diagnosing misconceptions, asking guiding questions, clarifying why, revealing structure, connecting ideas.
-  - Low score when the tutor only gives conclusions or mechanical steps without building understanding.
+  Does the tutor diagnose the student's specific confusion and build deeper
+  understanding — or just deliver a generically correct explanation?
+
+  - 5: Precisely identifies the student's specific misconception or confusion
+    point, reveals the deeper "why" (underlying principles, how concepts
+    connect), and uses guiding questions or analogies to lead the student
+    toward understanding rather than just stating the answer.
+  - 4: Good diagnosis of the student's issue with meaningful conceptual
+    depth; minor room for improvement in guiding vs. telling.
+  - 3: Gives a correct explanation, but it is generic — it would be roughly
+    the same response regardless of what the student specifically said or
+    where exactly they are confused. Does not clearly diagnose the student's
+    particular misunderstanding.
+  - 2: Superficial or formulaic response with little diagnostic effort;
+    mostly restates facts without revealing structure or reasoning.
+  - 1: Only states conclusions or mechanical steps with no conceptual
+    insight or attention to the student's specific situation.
 
   2) Applicability:
-  - Does the response provide actionable guidance that the student can directly apply?
-  - Good signals: concrete steps, procedures, checks, examples tied to the task, transferable method.
-  - Low score when the response is abstract or vague and cannot be executed.
+  Does the tutor provide concrete, actionable guidance specific to the
+  student's question — or give generic advice?
 
-  Use null when not applicable (e.g., pure greeting / small talk / logistics with no real teaching content).
+  - 5: Provides specific, actionable steps or concrete examples that
+    directly address the student's question. Includes verifiable elements
+    the student can act on (e.g., worked examples, step-by-step procedures,
+    concrete checks, calculations).
+  - 4: Good actionable content mostly specific to the student's situation;
+    minor gaps in concreteness.
+  - 3: Gives reasonable advice but generic or lacking concrete steps the
+    student can immediately follow or verify. Could apply to almost any
+    student asking a similar broad question.
+  - 2: Mostly abstract, hard for the student to execute or verify.
+  - 1: Vague, irrelevant, or cannot be acted upon at all.
+
+  Use null when not applicable (e.g., pure greeting / small talk / logistics
+  with no real teaching content).
 
   Output JSON only:
   {
