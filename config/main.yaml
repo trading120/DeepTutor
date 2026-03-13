@@ -45,7 +45,7 @@ question:
       rag_tool: true
       write_code: true
 solve:
-  max_react_iterations: 10       # Max ReAct rounds per plan step
+  max_react_iterations: 3        # Max ReAct rounds per plan step
   max_plan_steps: 10            # Max steps in a plan
   max_replans: 2                # Max replan attempts
   observation_max_tokens: 2000  # Truncation limit for tool results
