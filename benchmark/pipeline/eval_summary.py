@@ -31,6 +31,77 @@ def _safe_avg(vals: list[float]) -> float | None:
     return round(sum(vals) / len(vals), 4) if vals else None
 
 
+def _fmt_num(v: Any) -> str:
+    if isinstance(v, float):
+        return f"{v:.4f}"
+    if isinstance(v, int):
+        return str(v)
+    return "-"
+
+
+def _fmt_ratio_pct(v: Any) -> str:
+    if isinstance(v, (int, float)):
+        return f"{100.0 * float(v):.2f}%"
+    return "-"
+
+
+def _build_backend_markdown_table(by_backend: dict[str, dict[str, Any]]) -> str:
+    headers = [
+        "Backend",
+        "Profiles",
+        "Faith",
+        "Personal.",
+        "Applic.",
+        "Vivid.",
+        "Logic",
+        "Faith Fail",
+        "Teach Fail",
+        "PQ Fail",
+        "PQ Ground",
+    ]
+    lines = [
+        "| " + " | ".join(headers) + " |",
+        "| " + " | ".join(["---"] * len(headers)) + " |",
+    ]
+    for backend in sorted(by_backend.keys()):
+        b = by_backend[backend]
+        pq = b.get("practice_questions", {}) or {}
+        row = [
+            backend,
+            _fmt_num(b.get("num_profiles")),
+            _fmt_num(b.get("avg_faithfulness")),
+            _fmt_num(b.get("avg_personalization")),
+            _fmt_num(b.get("avg_applicability")),
+            _fmt_num(b.get("avg_vividness")),
+            _fmt_num(b.get("avg_logical_depth")),
+            _fmt_ratio_pct(b.get("faithfulness_eval_failed_ratio")),
+            _fmt_ratio_pct(b.get("teaching_quality_eval_failed_ratio")),
+            _fmt_ratio_pct(pq.get("eval_failed_ratio")),
+            _fmt_num(pq.get("avg_groundedness")),
+        ]
+        lines.append("| " + " | ".join(row) + " |")
+    return "\n".join(lines)
+
+
+def _build_markdown_report(
+    *,
+    title: str,
+    output_root: Path,
+    num_eval_files: int,
+    by_backend: dict[str, dict[str, Any]],
+) -> str:
+    table = _build_backend_markdown_table(by_backend)
+    return (
+        f"# {title}\n\n"
+        f"- Generated at: {datetime.now().isoformat()}\n"
+        f"- Output root: `{output_root}`\n"
+        f"- Eval files: {num_eval_files}\n"
+        f"- Backends: {len(by_backend)}\n\n"
+        "## Metrics Table\n\n"
+        f"{table}\n"
+    )
+
+
 def _extract_eval_summary(eval_data: dict) -> dict:
     # Multi-session evals store aggregated metrics under "aggregate".
     if isinstance(eval_data.get("aggregate"), dict):
@@ -247,14 +318,24 @@ def main() -> None:
         kb_summary_path.parent.mkdir(parents=True, exist_ok=True)
         with open(kb_summary_path, "w", encoding="utf-8") as f:
             json.dump(kb_summary, f, ensure_ascii=False, indent=2)
+        kb_summary_md_path = evaluations_root / kb_name / "summary.md"
+        kb_md = _build_markdown_report(
+            title=f"Evaluation Summary - {kb_name}",
+            output_root=output_root,
+            num_eval_files=len(kb_records),
+            by_backend=by_backend,
+        )
+        kb_summary_md_path.write_text(kb_md, encoding="utf-8")
 
         by_kb_manifest[kb_name] = {
             "summary_path": str(kb_summary_path),
+            "summary_markdown_path": str(kb_summary_md_path),
             "num_eval_files": len(kb_records),
             "num_backends": len(by_backend),
         }
         global_records.extend(kb_records)
         print(f"[KB] {kb_name}: {kb_summary_path}")
+        print(f"[KB Table] {kb_name}: {kb_summary_md_path}")
 
     overall_by_backend = _build_backend_aggregate(global_records)
     manifest = {
@@ -273,8 +354,17 @@ def main() -> None:
     manifest_path = manifests_root / "eval_summary_manifest.json"
     with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False, indent=2)
+    manifest_md_path = manifests_root / "eval_summary_manifest.md"
+    manifest_md = _build_markdown_report(
+        title="Evaluation Summary - Overall",
+        output_root=output_root,
+        num_eval_files=len(global_records),
+        by_backend=overall_by_backend,
+    )
+    manifest_md_path.write_text(manifest_md, encoding="utf-8")
 
     print(f"[Manifest] {manifest_path}")
+    print(f"[Manifest Table] {manifest_md_path}")
     print(
         f"Done. KBs: {manifest['num_kbs']} | "
         f"Eval files: {manifest['num_eval_files_total']} | "
