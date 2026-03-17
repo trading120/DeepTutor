@@ -5,9 +5,8 @@
 # ============================================
 # User Generated Data and Outputs
 # ============================================
-data
-data/user/
-data/knowledge_bases/
+data/**
+!data/README.md
 run_code_workspace/
 src/agents/question/reference_papers/
 src/services/rag/eg_only_for_analysis/
