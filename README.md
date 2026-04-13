@@ -67,6 +67,7 @@ See `.env.example` for all available configuration options, including:
 | `MODEL_NAME` | Model to use (e.g., `gpt-4o`) |
 | `EMBEDDING_MODEL` | Embedding model for document indexing |
 | `MAX_UPLOAD_SIZE_MB` | Maximum file upload size (I bumped this to 50 for larger textbooks) |
+| `MAX_CHAT_HISTORY` | Number of past turns to keep in context (I set this to 20 to preserve more conversation context) |
 
 ## Project Structure
 
@@ -100,4 +101,4 @@ This project is licensed under the MIT License. See [LICENSE](LICENSE) for detai
 ## Acknowledgements
 
 - Original project: [HKUDS/DeepTutor](https://github.com/HKUDS/DeepTutor)
-- Built with [LangChain](https://github.com/langchain-ai/langchain), [Gradio](https:
+- Built with [LangChain](https://github.com/langchain-ai/langchain)
