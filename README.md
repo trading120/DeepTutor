@@ -98,7 +98,10 @@ Contributions are welcome! Please open an issue first to discuss major changes.
 
 This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
 
-## Acknowledgements
+## Personal Notes
 
-- Original project: [HKUDS/DeepTutor](https://github.com/HKUDS/DeepTutor)
-- Built with [LangChain](https://github.com/langchain-ai/langchain)
+I'm using this primarily to work through ML/stats papers. A few things I found helpful:
+- Setting `MODEL_NAME=gpt-4o` gives noticeably better explanations for math-heavy content compared to `gpt-4o-mini`.
+- If the app feels slow on first document load, it's the embedding step — subsequent queries on the same doc are much faster.
+
+## Acknowledge
