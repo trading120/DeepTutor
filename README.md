@@ -100,8 +100,4 @@ This project is licensed under the MIT License. See [LICENSE](LICENSE) for detai
 
 ## Personal Notes
 
-I'm using this primarily to work through ML/stats papers. A few things I found helpful:
-- Setting `MODEL_NAME=gpt-4o` gives noticeably better explanations for math-heavy content compared to `gpt-4o-mini`.
-- If the app feels slow on first document load, it's the embedding step — subsequent queries on the same doc are much faster.
-
-## Acknowledge
+This is my personal fork for learning and experimenting with RAG-based tutoring systems. I'm primarily using this with `gpt-4o-mini` to keep API costs low while working through ML papers. If you stumbled across this repo, the upstream [HKUDS/DeepTutor](https://github.com/HKUDS/DeepTutor) is probably what you're looking for.
