@@ -66,7 +66,7 @@ See `.env.example` for all available configuration options, including:
 | `OPENAI_API_KEY` | Your OpenAI API key |
 | `MODEL_NAME` | Model to use (e.g., `gpt-4o`) |
 | `EMBEDDING_MODEL` | Embedding model for document indexing |
-| `MAX_UPLOAD_SIZE_MB` | Maximum file upload size |
+| `MAX_UPLOAD_SIZE_MB` | Maximum file upload size (I bumped this to 50 for larger textbooks) |
 
 ## Project Structure
 
@@ -100,4 +100,4 @@ This project is licensed under the MIT License. See [LICENSE](LICENSE) for detai
 ## Acknowledgements
 
 - Original project: [HKUDS/DeepTutor](https://github.com/HKUDS/DeepTutor)
-- Built with [LangChain](https://github.com/langchain-ai/langchain), [Gradio](https://github.com/gradio-app/gradio), and [LlamaIndex](https://github.com/run-llama/llama_index)
+- Built with [LangChain](https://github.com/langchain-ai/langchain), [Gradio](https:
